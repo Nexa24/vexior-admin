@@ -208,7 +208,7 @@ class CategoryManager {
     getDefaultCategories() {
         return [
             { id: 'all', name: 'All Products', image: 'https://via.placeholder.com/60x60?text=ALL', color: '#667eea' },
-            { id: 'today offer', name: 'Today\'s Offers', image: 'https://via.placeholder.com/60x60?text=OFFER', color: '#6c757d', special: true },
+            { id: 'today offer', name: 'Today\'s Offers', image: 'https://via.placeholder.com/60x60?text=OFFER', color: '#00b140', special: true },
             { id: 'watches', name: 'Watches', image: 'https://via.placeholder.com/60x60?text=WATCH', color: '#28a745' },
             { id: 'smart-watches', name: 'Smart Watches', image: 'https://via.placeholder.com/60x60?text=SMART', color: '#667eea' },
             { id: 'gadgets', name: 'Gadgets', image: 'https://via.placeholder.com/60x60?text=GADGET', color: '#667eea' },

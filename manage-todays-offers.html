@@ -276,10 +276,33 @@
                 let cats = (prod && Array.isArray(prod.categories)) ? [...prod.categories] : [];
                 if (!cats.includes('today offer')) cats.push('today offer');
 
-                await db.collection("products").doc(productId).update({
-                    category: "today offer",
-                    categories: cats
-                });
+                let updated = false;
+                try {
+                    const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 2500));
+                    await Promise.race([
+                        db.collection("products").doc(productId).update({
+                            category: "today offer",
+                            categories: cats
+                        }),
+                        timeoutPromise
+                    ]);
+                    updated = true;
+                } catch (sdkErr) {
+                    console.warn('[Admin] SDK addToOffers failed, using direct REST fallback:', sdkErr);
+                }
+
+                if (!updated) {
+                    await fetch(`https://firestore.googleapis.com/v1/projects/wackykicks-65cbe/databases/(default)/documents/products/${productId}?updateMask.fieldPaths=category&updateMask.fieldPaths=categories`, {
+                        method: 'PATCH',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            fields: {
+                                category: { stringValue: 'today offer' },
+                                categories: { arrayValue: { values: cats.map(c => ({ stringValue: c })) } }
+                            }
+                        })
+                    });
+                }
 
                 if (prod) {
                     prod.category = 'today offer';
@@ -304,10 +327,33 @@
                 const prod = allLoadedProducts.find(p => p.id === productId);
                 let cats = (prod && Array.isArray(prod.categories)) ? prod.categories.filter(c => c !== 'today offer' && c !== "today's offer") : [];
 
-                await db.collection("products").doc(productId).update({
-                    category: firebase.firestore.FieldValue.delete(),
-                    categories: cats
-                });
+                let updated = false;
+                try {
+                    const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 2500));
+                    await Promise.race([
+                        db.collection("products").doc(productId).update({
+                            category: firebase.firestore.FieldValue.delete(),
+                            categories: cats
+                        }),
+                        timeoutPromise
+                    ]);
+                    updated = true;
+                } catch (sdkErr) {
+                    console.warn('[Admin] SDK removeFromOffers failed, using direct REST fallback:', sdkErr);
+                }
+
+                if (!updated) {
+                    await fetch(`https://firestore.googleapis.com/v1/projects/wackykicks-65cbe/databases/(default)/documents/products/${productId}?updateMask.fieldPaths=category&updateMask.fieldPaths=categories`, {
+                        method: 'PATCH',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            fields: {
+                                category: { nullValue: null },
+                                categories: { arrayValue: { values: cats.map(c => ({ stringValue: c })) } }
+                            }
+                        })
+                    });
+                }
 
                 if (prod) {
                     delete prod.category;

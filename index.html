@@ -1736,6 +1736,17 @@
         const app = initializeApp(firebaseConfig);
         const db = getFirestore(app);
 
+        // Safe alert helper that never crashes if FloatingAlertManager is absent
+        function notify(type, msg, title) {
+            if (window.alerts && typeof window.alerts[type] === 'function') {
+                window.alerts[type](msg, title);
+            } else if (type === 'error' || type === 'warning') {
+                alert((title ? title + ': ' : '') + msg);
+            } else {
+                console.log(`[Admin ${type}]`, title || '', msg);
+            }
+        }
+
         // Form references
         const nameInput = document.getElementById("productName");
         const oldPriceInput = document.getElementById("productOldPrice");
@@ -1813,13 +1824,9 @@
                 }
 
                 // Visual feedback
-                if (window.FloatingAlertManager) {
-                    window.alerts.success(`Added ${colorName} to selection`, 'Color Added');
-                }
+                notify('success', `Added ${colorName} to selection`, 'Color Added');
             } else {
-                if (window.FloatingAlertManager) {
-                    window.alerts.warning(`${colorName} is already selected`, 'Color Already Selected');
-                }
+                notify('warning', `${colorName} is already selected`, 'Color Already Selected');
             }
         };
 
@@ -1831,11 +1838,7 @@
             const hexValue = colorPicker.value;
 
             if (!colorName) {
-                if (window.FloatingAlertManager) {
-                    window.alerts.warning('Please enter a color name', 'Color Name Required');
-                } else {
-                    alert('Please enter a color name');
-                }
+                notify('warning', 'Please enter a color name', 'Color Name Required');
                 return;
             }
 
@@ -1865,13 +1868,9 @@
                 nameInput.value = '';
                 colorPicker.value = '#3b82f6';
 
-                if (window.FloatingAlertManager) {
-                    window.alerts.success(`Added custom color: ${colorName}`, 'Custom Color Added');
-                }
+                notify('success', `Added custom color: ${colorName}`, 'Custom Color Added');
             } else {
-                if (window.FloatingAlertManager) {
-                    window.alerts.warning(`${colorName} is already selected`, 'Color Already Selected');
-                }
+                notify('warning', `${colorName} is already selected`, 'Color Already Selected');
             }
         };
 
@@ -2105,9 +2104,7 @@
                     updateImagePreview();
                 } catch (error) {
                     console.error('Error processing image:', error);
-                    if (window.FloatingAlertManager) {
-                        window.alerts.error(`Failed to process ${file.name}`, 'Upload Error');
-                    }
+                    notify('error', `Failed to process ${file.name}`, 'Upload Error');
                 }
             }
         }
@@ -2124,10 +2121,10 @@
                         const canvas = document.createElement('canvas');
                         const ctx = canvas.getContext('2d');
 
-                        // Calculate new dimensions (max 1200px width/height)
+                        // Calculate new dimensions (max 900px width/height for fast loading & Firestore limits)
                         let width = img.width;
                         let height = img.height;
-                        const maxSize = 1200;
+                        const maxSize = 900;
 
                         if (width > maxSize || height > maxSize) {
                             if (width > height) {
@@ -2149,8 +2146,8 @@
                         let quality = 0.8;
                         let base64 = canvas.toDataURL('image/jpeg', quality);
 
-                        // If still too large (>400KB), reduce quality
-                        while (base64.length > 400000 && quality > 0.3) {
+                        // Ensure each image is <= 180KB so multiple images never exceed Firestore 1MB doc limit
+                        while (base64.length > 180000 && quality > 0.25) {
                             quality -= 0.1;
                             base64 = canvas.toDataURL('image/jpeg', quality);
                         }
@@ -2582,7 +2579,7 @@
         function toFirestoreRestDoc(obj) {
             const fields = {};
             for (const key of Object.keys(obj)) {
-                if (key === 'id' || key === 'img' || obj[key] === undefined) continue;
+                if (key === 'id' || obj[key] === undefined) continue;
                 fields[key] = toFirestoreRestValue(obj[key]);
             }
             return { fields };
@@ -2608,7 +2605,7 @@
             try {
                 const restDoc = toFirestoreRestDoc(productData);
                 if (isEdit) {
-                    const fieldMask = Object.keys(productData).filter(k => k !== 'id' && k !== 'img' && productData[k] !== undefined)
+                    const fieldMask = Object.keys(productData).filter(k => k !== 'id' && productData[k] !== undefined)
                         .map(k => `updateMask.fieldPaths=${encodeURIComponent(k)}`).join('&');
                     const res = await fetch(`https://firestore.googleapis.com/v1/projects/wackykicks-65cbe/databases/(default)/documents/products/${productId}?${fieldMask}`, {
                         method: 'PATCH',
@@ -2667,20 +2664,18 @@
             const stockValue = stockInput.value.trim();
             const stock = stockValue !== '' ? parseInt(stockValue) : undefined;
 
-            // Get images based on upload method
+            // Get images: check uploadedImages first, then multiImageInput
             let imgUrl = [];
-            if (currentUploadMethod === 'file') {
-                imgUrl = uploadedImages
-                    .filter(img => !img.loading && img.base64)
-                    .map(img => img.base64);
-            } else {
-                const multiInput = document.getElementById("multiImageInput");
-                if (multiInput && multiInput.value) {
-                    imgUrl = multiInput.value
-                        .split(',')
-                        .map(url => url.trim())
-                        .filter(url => url);
-                }
+            const validUploaded = uploadedImages.filter(img => !img.loading && img.base64).map(img => img.base64);
+            if (validUploaded.length > 0) {
+                imgUrl = validUploaded;
+            }
+            const multiInput = document.getElementById("multiImageInput");
+            if (imgUrl.length === 0 && multiInput && multiInput.value.trim()) {
+                imgUrl = multiInput.value
+                    .split(',')
+                    .map(url => url.trim())
+                    .filter(url => url);
             }
 
             // In edit mode: if user didn't modify images, retain existing images
@@ -2690,7 +2685,7 @@
                     if (Array.isArray(existing.imgUrl) && existing.imgUrl.length > 0) {
                         imgUrl = existing.imgUrl;
                     } else if (existing.img) {
-                        imgUrl = [existing.img];
+                        imgUrl = Array.isArray(existing.img) ? existing.img : [existing.img];
                     }
                 }
             }
@@ -2701,7 +2696,7 @@
             const categories = getSelectedProductCategories();
 
             if (!name || !oldPrice || !newPrice || imgUrl.length === 0) {
-                if (window.FloatingAlertManager) {
+                if (window.alerts && typeof window.alerts.warning === 'function') {
                     window.alerts.warning('Name, Old Price, New Price, and at least one Image are required.', 'Missing Required Fields');
                 } else {
                     alert("Name, Old Price, New Price, and at least one Image URL are required.");
@@ -2716,16 +2711,21 @@
             }
 
             try {
+                const firstImg = imgUrl.length > 0 ? imgUrl[0] : '';
+                const primaryCategory = categories.length > 0 ? (categories.includes('today offer') ? 'today offer' : categories[0]) : '';
+
                 const productData = {
                     name,
                     price,
                     oldPrice,
                     newPrice,
+                    img: firstImg,
                     imgUrl,
                     sizes,
                     colors,
                     description,
-                    categories
+                    categories,
+                    category: primaryCategory
                 };
 
                 if (stock !== undefined) {
@@ -2737,12 +2737,14 @@
                     const idx = allProducts.findIndex(p => p.id === editingProductId);
                     if (idx !== -1) {
                         allProducts[idx] = { id: editingProductId, ...productData };
-                        allProducts[idx].img = Array.isArray(productData.imgUrl) ? productData.imgUrl[0] : (productData.imgUrl || '');
+                        allProducts[idx].img = firstImg;
                     }
                     await setCachedProductsAsync(allProducts);
                     displayProducts(allProducts);
-                    if (window.FloatingAlertManager) {
+                    if (window.FloatingAlertManager && typeof window.FloatingAlertManager.productUpdated === 'function') {
                         window.FloatingAlertManager.productUpdated();
+                    } else if (window.alerts && typeof window.alerts.success === 'function') {
+                        window.alerts.success('Product updated successfully!', 'Product Updated!');
                     } else {
                         alert("Product updated successfully!");
                     }
@@ -2752,14 +2754,16 @@
                     const newProd = {
                         id: result.id,
                         ...productData,
-                        img: Array.isArray(productData.imgUrl) ? productData.imgUrl[0] : (productData.imgUrl || '')
+                        img: firstImg
                     };
                     allProducts.unshift(newProd);
                     await setCachedProductsAsync(allProducts);
                     displayProducts(allProducts);
                     updateSearchInfo(allProducts.length, allProducts.length);
-                    if (window.FloatingAlertManager) {
+                    if (window.FloatingAlertManager && typeof window.FloatingAlertManager.productAdded === 'function') {
                         window.FloatingAlertManager.productAdded();
+                    } else if (window.alerts && typeof window.alerts.success === 'function') {
+                        window.alerts.success('Product added successfully!', 'Product Added!');
                     } else {
                         alert("Product added successfully!");
                     }
@@ -2768,7 +2772,7 @@
                 resetForm();
             } catch (err) {
                 console.error('[Admin] Error saving product:', err);
-                if (window.FloatingAlertManager) {
+                if (window.alerts && typeof window.alerts.error === 'function') {
                     window.alerts.error("Error saving product: " + err.message, 'Save Error');
                 } else {
                     alert("Error saving product: " + err.message);
@@ -2790,14 +2794,16 @@
                 await setCachedProductsAsync(allProducts);
                 displayProducts(allProducts);
                 updateSearchInfo(allProducts.length, allProducts.length);
-                if (window.FloatingAlertManager) {
+                if (window.FloatingAlertManager && typeof window.FloatingAlertManager.productDeleted === 'function') {
                     window.FloatingAlertManager.productDeleted();
+                } else if (window.alerts && typeof window.alerts.success === 'function') {
+                    window.alerts.success('Product deleted successfully!', 'Product Deleted!');
                 } else {
                     alert("Product deleted successfully!");
                 }
             } catch (err) {
                 console.error('[Admin] Error deleting product:', err);
-                if (window.FloatingAlertManager) {
+                if (window.alerts && typeof window.alerts.error === 'function') {
                     window.alerts.error("Error deleting product: " + err.message, 'Delete Error');
                 } else {
                     alert("Error deleting product: " + err.message);
@@ -2834,11 +2840,7 @@
             }
 
             if (!product) {
-                if (window.FloatingAlertManager) {
-                    window.alerts.error("Product not found in database.", 'Product Not Found');
-                } else {
-                    alert("Product not found.");
-                }
+                notify('error', 'Product not found in database.', 'Product Not Found');
                 return;
             }
 
@@ -2870,10 +2872,12 @@
             updateColorDisplay();
             updateColorInput();
 
-            // Set categories if available
-            if (product.categories) {
-                setProductCategories(product.categories);
+            // Set categories if available (ensure availableCategories is loaded first)
+            if (availableCategories.length === 0) {
+                await loadProductCategories();
             }
+            const productCategories = Array.isArray(product.categories) ? product.categories : (product.category ? [product.category] : []);
+            setProductCategories(productCategories);
 
             // Handle images safely (support array, string, or empty)
             let images = [];
@@ -3122,11 +3126,7 @@
             const clearBtn = document.getElementById('clearSearchBtn');
 
             if (!searchTerm) {
-                if (window.FloatingAlertManager) {
-                    window.alerts.warning('Please enter a search term', 'Search Required');
-                } else {
-                    alert('Please enter something to search for');
-                }
+                notify('warning', 'Please enter a search term', 'Search Required');
                 return;
             }
 
@@ -3152,9 +3152,7 @@
             updateSearchInfo(filteredProducts.length, allProducts.length);
             isSearchActive = true;
 
-            if (window.FloatingAlertManager) {
-                window.alerts.success(`Found ${filteredProducts.length} product(s)`, 'Search Complete');
-            }
+            notify('success', `Found ${filteredProducts.length} product(s)`, 'Search Complete');
         };
 
         window.clearSearch = () => {
@@ -3168,9 +3166,7 @@
             hideSearchInfo();
             isSearchActive = false;
 
-            if (window.FloatingAlertManager) {
-                window.alerts.info('Search cleared', 'Search Reset');
-            }
+            notify('info', 'Search cleared', 'Search Reset');
         };
 
         window.showAllProducts = () => {
@@ -3234,10 +3230,15 @@
 
         // Highlight active link
         const path = window.location.pathname;
-        if (path.includes("admin.html")) {
-            document.getElementById("nav-admin").classList.add("active");
-        } else if (path.includes("photo-to-url.html")) {
-            document.getElementById("nav-converter").classList.add("active");
+        if (path.includes("photo-to-url.html")) {
+            document.getElementById("nav-converter")?.classList.add("active");
+            document.getElementById("bottom-converter")?.classList.add("active");
+        } else if (path.includes("categories.html")) {
+            document.getElementById("nav-categories")?.classList.add("active");
+            document.getElementById("bottom-categories")?.classList.add("active");
+        } else {
+            document.getElementById("nav-admin")?.classList.add("active");
+            document.getElementById("bottom-admin")?.classList.add("active");
         }
     </script>
 

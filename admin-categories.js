@@ -244,7 +244,8 @@ class AdminCategoryManager {
             }
 
             // Check if we need to add the sort button in the header
-            const sectionHeader = document.querySelector('.reorder-categories-section .btn-primary').parentElement;
+            const reorderBtn = document.querySelector('.reorder-categories-section .btn-primary');
+            const sectionHeader = reorderBtn ? reorderBtn.parentElement : null;
             if (sectionHeader && !document.getElementById('reorderSortBtn')) {
                 const sortBtn = document.createElement('button');
                 sortBtn.id = 'reorderSortBtn';
@@ -548,7 +549,7 @@ class AdminCategoryManager {
     getDefaultCategories() {
         return [
             { id: 'all', name: 'All Products', image: 'https://via.placeholder.com/60x60?text=ALL', color: '#667eea' },
-            { id: 'today offer', name: 'Today\'s Offers', image: 'https://via.placeholder.com/60x60?text=OFFER', color: '#6c757d', special: true, description: 'Limited time special offers and deals' },
+            { id: 'today offer', name: 'Today\'s Offers', image: 'https://via.placeholder.com/60x60?text=OFFER', color: '#00b140', special: true, description: 'Limited time special offers and deals' },
             { id: 'watches', name: 'Watches', image: 'https://via.placeholder.com/60x60?text=WATCH', color: '#28a745' },
             { id: 'smart-watches', name: 'Smart Watches', image: 'https://via.placeholder.com/60x60?text=SMART', color: '#3b82f6' },
             { id: 'gadgets', name: 'Gadgets', image: 'https://via.placeholder.com/60x60?text=GADGET', color: '#8b5cf6' },
@@ -1002,12 +1003,41 @@ class AdminCategoryManager {
         }
 
         try {
-            if (typeof db !== 'undefined') {
-                await db.collection('category').doc('CONFIG_display_order').set({
-                    order: newOrder,
-                    updatedAt: firebase.firestore.FieldValue.serverTimestamp()
-                }, { merge: true });
+            let saved = false;
 
+            // Attempt 1: Firebase SDK with timeout
+            if (typeof db !== 'undefined') {
+                try {
+                    const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 2500));
+                    await Promise.race([
+                        db.collection('category').doc('CONFIG_display_order').set({
+                            order: newOrder,
+                            updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+                        }, { merge: true }),
+                        timeoutPromise
+                    ]);
+                    saved = true;
+                } catch (sdkErr) {
+                    console.warn('[Admin] Category order SDK save failed or timed out, trying REST:', sdkErr);
+                }
+            }
+
+            // Attempt 2: Direct Google Cloud REST API fallback
+            if (!saved) {
+                const res = await fetch('https://firestore.googleapis.com/v1/projects/wackykicks-65cbe/databases/(default)/documents/category/CONFIG_display_order?updateMask.fieldPaths=order', {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        fields: {
+                            order: { arrayValue: { values: newOrder.map(id => ({ stringValue: id })) } }
+                        }
+                    })
+                });
+                if (!res.ok) throw new Error(`REST PATCH returned HTTP ${res.status}`);
+                saved = true;
+            }
+
+            if (saved) {
                 if (saveBtn) {
                     saveBtn.innerHTML = '<i class="fas fa-check"></i> Saved!';
                     saveBtn.classList.remove('btn-primary');
@@ -1024,13 +1054,6 @@ class AdminCategoryManager {
                         saveBtn.disabled = false;
                     }
                 }, 2000);
-
-            } else {
-                this.showMessage('Cannot save: Firebase not available.', 'error');
-                if (saveBtn) {
-                    saveBtn.innerHTML = 'Error';
-                    saveBtn.disabled = false;
-                }
             }
         } catch (error) {
             console.error('Error saving order:', error);
@@ -2081,16 +2104,39 @@ class AdminCategoryManager {
                         finalCategories = [...new Set([...existingCategories, ...selectedCategories])];
                     }
 
-                    // Update product in database
+                    // Update product in database (with REST fallback)
+                    let updatedInDb = false;
+                    const primaryCat = finalCategories.length > 0 ? (finalCategories.includes('today offer') ? 'today offer' : finalCategories[0]) : '';
                     if (typeof db !== 'undefined') {
-                        console.log(`Updating database for product: ${product.name}`);
-                        await db.collection('products').doc(product.id).update({
-                            categories: finalCategories,
-                            updatedAt: new Date().toISOString()
+                        try {
+                            const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 2000));
+                            await Promise.race([
+                                db.collection('products').doc(product.id).update({
+                                    categories: finalCategories,
+                                    category: primaryCat,
+                                    updatedAt: new Date().toISOString()
+                                }),
+                                timeoutPromise
+                            ]);
+                            updatedInDb = true;
+                        } catch (sdkErr) {
+                            console.warn(`[Admin] SDK update failed for ${product.name}, using REST fallback:`, sdkErr);
+                        }
+                    }
+
+                    if (!updatedInDb) {
+                        const catVals = finalCategories.map(c => ({ stringValue: c }));
+                        await fetch(`https://firestore.googleapis.com/v1/projects/wackykicks-65cbe/databases/(default)/documents/products/${product.id}?updateMask.fieldPaths=categories&updateMask.fieldPaths=category`, {
+                            method: 'PATCH',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                fields: {
+                                    categories: { arrayValue: { values: catVals } },
+                                    category: { stringValue: primaryCat }
+                                }
+                            })
                         });
-                        console.log(`Database update successful for: ${product.name}`);
-                    } else {
-                        console.warn('Database (db) is not defined, skipping database update');
+                        updatedInDb = true;
                     }
 
                     // Update local product data
