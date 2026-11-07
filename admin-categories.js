@@ -1,3 +1,107 @@
+// ✅ High-capacity IndexedDB Cache for categories admin (shares VexiorCatalogDB)
+function openAdminIndexedDB() {
+    return new Promise((resolve, reject) => {
+        if (typeof window === 'undefined' || !window.indexedDB) return reject(new Error('IndexedDB not supported'));
+        const request = window.indexedDB.open('VexiorCatalogDB', 1);
+        request.onupgradeneeded = (e) => {
+            const idb = e.target.result;
+            if (!idb.objectStoreNames.contains('products_store')) {
+                idb.createObjectStore('products_store');
+            }
+        };
+        request.onsuccess = (e) => resolve(e.target.result);
+        request.onerror = (e) => reject(e.target.error);
+    });
+}
+
+async function getAdminCachedProducts() {
+    try {
+        const idb = await openAdminIndexedDB();
+        return await new Promise((resolve) => {
+            const tx = idb.transaction('products_store', 'readonly');
+            const store = tx.objectStore('products_store');
+            const req = store.get('all_products');
+            req.onsuccess = () => {
+                const res = req.result;
+                if (res && Array.isArray(res.data) && res.data.length > 0) resolve(res.data);
+                else resolve(null);
+            };
+            req.onerror = () => resolve(null);
+        });
+    } catch (e) {
+        return null;
+    }
+}
+
+async function setAdminCachedProducts(products) {
+    if (!products || !products.length) return;
+    try {
+        const idb = await openAdminIndexedDB();
+        const tx = idb.transaction('products_store', 'readwrite');
+        const store = tx.objectStore('products_store');
+        store.put({ timestamp: Date.now(), data: products }, 'all_products');
+    } catch (e) {
+        console.warn('Could not save to IndexedDB:', e);
+    }
+}
+
+function parseAdminFirestoreValue(val) {
+    if (!val) return null;
+    if ('stringValue' in val) return val.stringValue;
+    if ('integerValue' in val) return parseInt(val.integerValue, 10);
+    if ('doubleValue' in val) return parseFloat(val.doubleValue);
+    if ('booleanValue' in val) return val.booleanValue;
+    if ('timestampValue' in val) return val.timestampValue;
+    if ('arrayValue' in val) {
+        const values = (val.arrayValue && val.arrayValue.values) || [];
+        return values.map(v => parseAdminFirestoreValue(v));
+    }
+    if ('mapValue' in val) {
+        const fields = (val.mapValue && val.mapValue.fields) || {};
+        const res = {};
+        for (const k of Object.keys(fields)) {
+            res[k] = parseAdminFirestoreValue(fields[k]);
+        }
+        return res;
+    }
+    return null;
+}
+
+function parseAdminFirestoreProduct(doc) {
+    if (!doc || !doc.fields) return null;
+    const id = doc.name ? doc.name.split('/').pop() : '';
+    const fields = doc.fields || {};
+    const item = { id };
+    for (const key of Object.keys(fields)) {
+        item[key] = parseAdminFirestoreValue(fields[key]);
+    }
+    if (typeof item.imgUrl === 'string') {
+        item.imgUrl = [item.imgUrl];
+    } else if (!Array.isArray(item.imgUrl)) {
+        item.imgUrl = item.img ? [item.img] : [];
+    }
+    item.img = item.imgUrl[0] || item.img || '';
+    item.categories = item.categories || [];
+    return item;
+}
+
+async function fetchAdminProductsViaRest(onBatchLoaded = null) {
+    let allFetched = [];
+    let pageToken = null;
+    do {
+        let url = `https://firestore.googleapis.com/v1/projects/wackykicks-65cbe/databases/(default)/documents/products?pageSize=100`;
+        if (pageToken) url += `&pageToken=${encodeURIComponent(pageToken)}`;
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        const pageDocs = (data.documents || []).map(parseAdminFirestoreProduct).filter(Boolean);
+        allFetched = allFetched.concat(pageDocs);
+        if (typeof onBatchLoaded === 'function') onBatchLoaded(allFetched);
+        pageToken = data.nextPageToken || null;
+    } while (pageToken);
+    return allFetched;
+}
+
 // Admin Categories Management
 class AdminCategoryManager {
     constructor() {
@@ -22,8 +126,7 @@ class AdminCategoryManager {
                     const testQuery = await db.collection('category').limit(1).get();
                     console.log('Firebase connection successful, docs found:', testQuery.size);
                 } catch (firebaseError) {
-                    console.error('Firebase connection failed:', firebaseError);
-                    throw new Error('Firebase connection failed: ' + firebaseError.message);
+                    console.warn('Firebase connection test failed, will use resilient REST fallbacks:', firebaseError.message);
                 }
             } else {
                 console.warn('Firebase not available, will use fallback data');
@@ -80,7 +183,7 @@ class AdminCategoryManager {
 
         // Fetch display order logic
         this.fetchCurrentDisplayOrder().then(order => {
-            let sortedCats = [...this.categories];
+            let sortedCats = [...this.categories].filter(c => c.id !== 'CONFIG_display_order'); // Filter config doc
 
             // Sort locally based on order array
             if (order && order.length > 0) {
@@ -322,49 +425,74 @@ class AdminCategoryManager {
         console.log('=== LOADING CATEGORIES ===');
 
         try {
-            // Try direct Firebase first
+            let loadedCategories = [];
+            let fetchedViaSdk = false;
+
+            // Try direct Firebase first with a 2-second timeout
             if (typeof db !== 'undefined') {
-                console.log('Attempting to load from Firebase category collection...');
-                const categoriesSnapshot = await db.collection('category').get();
-                console.log('Firebase query result - size:', categoriesSnapshot.size);
+                try {
+                    console.log('Attempting to load from Firebase category collection...');
+                    const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Category SDK timeout')), 2000));
+                    const categoriesSnapshot = await Promise.race([db.collection('category').get(), timeoutPromise]);
 
-                this.categories = categoriesSnapshot.docs.map(doc => {
-                    const rawData = doc.data();
-                    const data = {
-                        id: doc.id, // Firebase document ID
-                        firebaseId: doc.id, // Keep reference to Firebase ID
-                        categoryId: rawData.id || rawData.name?.toLowerCase().replace(/[^a-z0-9]/g, '-') || doc.id, // Category identifier for products
-                        name: rawData.name || 'Unnamed Category',
-                        image: rawData.image || rawData.icon || '',
-                        color: rawData.color || '#667eea',
-                        description: rawData.description || '',
-                        ...rawData
-                    };
-                    console.log('Loaded category:', data.name, 'with Firebase ID:', doc.id, 'Category ID:', data.categoryId);
-                    return data;
-                });
+                    loadedCategories = categoriesSnapshot.docs.map(doc => {
+                        const rawData = doc.data();
+                        return {
+                            id: doc.id,
+                            firebaseId: doc.id,
+                            categoryId: rawData.id || rawData.name?.toLowerCase().replace(/[^a-z0-9]/g, '-') || doc.id,
+                            name: rawData.name || 'Unnamed Category',
+                            image: rawData.image || rawData.icon || '',
+                            color: rawData.color || '#667eea',
+                            description: rawData.description || '',
+                            ...rawData
+                        };
+                    }).filter(c => c.id !== 'CONFIG_display_order');
 
-                console.log('Successfully loaded from Firebase:', this.categories.length, 'categories');
+                    fetchedViaSdk = loadedCategories.length > 0;
+                } catch (e) {
+                    console.warn('⚠️ Category SDK fetch failed or timed out, trying REST fallback:', e.message || e);
+                }
+            }
+
+            // Fallback: Direct Google Cloud REST API (100% reliable)
+            if (!fetchedViaSdk) {
+                try {
+                    console.log('🌐 Fetching categories via direct Google Cloud REST API...');
+                    const res = await fetch('https://firestore.googleapis.com/v1/projects/wackykicks-65cbe/databases/(default)/documents/category');
+                    if (res.ok) {
+                        const data = await res.json();
+                        const docs = data.documents || [];
+                        loadedCategories = docs.map(d => {
+                            const id = d.name ? d.name.split('/').pop() : '';
+                            const fields = d.fields || {};
+                            const name = parseAdminFirestoreValue(fields.name) || 'Unnamed Category';
+                            return {
+                                id,
+                                firebaseId: id,
+                                categoryId: parseAdminFirestoreValue(fields.id) || name.toLowerCase().replace(/[^a-z0-9]/g, '-') || id,
+                                name,
+                                image: parseAdminFirestoreValue(fields.image) || parseAdminFirestoreValue(fields.icon) || '',
+                                color: parseAdminFirestoreValue(fields.color) || '#667eea',
+                                description: parseAdminFirestoreValue(fields.description) || ''
+                            };
+                        }).filter(c => c.id !== 'CONFIG_display_order');
+                    }
+                } catch (restErr) {
+                    console.warn('⚠️ Category REST fallback failed:', restErr);
+                }
+            }
+
+            if (loadedCategories.length > 0) {
+                this.categories = loadedCategories;
+                console.log('Successfully loaded categories:', this.categories.length);
             } else {
-                console.log('Firebase not available, using default categories');
+                console.log('Falling back to default categories');
                 this.categories = this.getDefaultCategories();
             }
-
-            // If no categories loaded, use defaults
-            if (this.categories.length === 0) {
-                console.log('No categories found in Firebase, using default categories');
-                this.categories = this.getDefaultCategories();
-            }
-
-            console.log('Final categories count:', this.categories.length);
-            this.categories.forEach((cat, index) => {
-                console.log(`Category ${index + 1}:`, cat.name, '| Image:', cat.image || 'none');
-            });
 
         } catch (error) {
-            console.error('Error loading categories from Firebase:', error);
-            console.error('Error details:', error.message);
-            console.log('Falling back to default categories');
+            console.error('Error loading categories:', error);
             this.categories = this.getDefaultCategories();
         }
 
@@ -376,35 +504,79 @@ class AdminCategoryManager {
         return [
             { id: 'all', name: 'All Products', image: 'https://via.placeholder.com/60x60?text=ALL', color: '#667eea' },
             { id: 'today offer', name: 'Today\'s Offers', image: 'https://via.placeholder.com/60x60?text=OFFER', color: '#6c757d', special: true, description: 'Limited time special offers and deals' },
-            { id: 'nike', name: 'Nike', image: 'https://via.placeholder.com/60x60?text=NIKE', color: '#000000' },
-            { id: 'adidas', name: 'Adidas', image: 'https://via.placeholder.com/60x60?text=ADIDAS', color: '#0066cc' },
-            { id: 'shoes', name: 'Shoes', image: 'https://via.placeholder.com/60x60?text=SHOES', color: '#ff6b35' },
             { id: 'watches', name: 'Watches', image: 'https://via.placeholder.com/60x60?text=WATCH', color: '#28a745' },
+            { id: 'smart-watches', name: 'Smart Watches', image: 'https://via.placeholder.com/60x60?text=SMART', color: '#3b82f6' },
+            { id: 'gadgets', name: 'Gadgets', image: 'https://via.placeholder.com/60x60?text=GADGET', color: '#8b5cf6' },
             { id: 'accessories', name: 'Accessories', image: 'https://via.placeholder.com/60x60?text=ACC', color: '#6f42c1' },
             { id: 'out-of-stock', name: 'Out of Stock', image: 'https://via.placeholder.com/60x60?text=OUT', color: '#ef4444' }
         ];
     }
 
     async loadProducts() {
+        console.log('=== LOADING PRODUCTS FOR CATEGORIES ===');
         try {
-            // Load products from Firebase or fallback data
-            if (typeof db !== 'undefined') {
-                const productsSnapshot = await db.collection('products').get();
-                this.products = productsSnapshot.docs.map(doc => ({
-                    id: doc.id,
-                    ...doc.data()
-                }));
-            } else {
-                // Fallback to mock data if Firebase is not available
-                this.products = this.getMockProducts();
+            // ⚡ 1. INSTANT RENDER: Check high-capacity IndexedDB cache first (0ms)
+            const cached = await getAdminCachedProducts();
+            if (cached && cached.length > 0) {
+                console.log('⚡ Loaded products from persistent cache:', cached.length);
+                this.products = cached;
+                this.filteredProducts = [...this.products];
+                this.updateProductCount();
+                this.setupProductSearch();
+                this.renderProductsList();
+
+                // Silent background sync to ensure latest updates
+                fetchAdminProductsViaRest().then(async (freshProducts) => {
+                    if (freshProducts && freshProducts.length > 0) {
+                        this.products = freshProducts;
+                        this.filteredProducts = [...this.products];
+                        this.updateProductCount();
+                        this.setupProductSearch();
+                        this.renderProductsList();
+                        await setAdminCachedProducts(this.products);
+                    }
+                }).catch(e => console.warn('Background products sync failed:', e));
+                return;
             }
 
-            this.filteredProducts = [...this.products];
-            this.updateProductCount();
-            this.setupProductSearch();
+            // ⚡ 2. Progressive loading: Fetch first batch fast for responsive UI
+            let initialRendered = false;
+            const allFetched = await fetchAdminProductsViaRest((currentList) => {
+                if (!initialRendered && currentList.length >= 5) {
+                    initialRendered = true;
+                    this.products = currentList.slice();
+                    this.filteredProducts = [...this.products];
+                    this.updateProductCount();
+                    this.setupProductSearch();
+                    this.renderProductsList();
+                }
+            });
+
+            if (allFetched && allFetched.length > 0) {
+                this.products = allFetched;
+                this.filteredProducts = [...this.products];
+                this.updateProductCount();
+                this.setupProductSearch();
+                this.renderProductsList();
+                await setAdminCachedProducts(this.products);
+                console.log(`✅ Loaded and cached all ${this.products.length} products`);
+            } else {
+                this.products = this.getMockProducts();
+                this.filteredProducts = [...this.products];
+                this.updateProductCount();
+                this.setupProductSearch();
+                this.renderProductsList();
+            }
+
         } catch (error) {
             console.error('Error loading products:', error);
-            this.products = this.getMockProducts();
+            if (!this.products || this.products.length === 0) {
+                this.products = this.getMockProducts();
+                this.filteredProducts = [...this.products];
+                this.updateProductCount();
+                this.setupProductSearch();
+                this.renderProductsList();
+            }
         }
     }
 
@@ -412,21 +584,21 @@ class AdminCategoryManager {
         return [
             {
                 id: '1',
-                name: 'Nike Zoom Vomero 5 White',
-                img: 'https://via.placeholder.com/200x200?text=Nike+Shoe',
-                categories: ['nike', 'shoes']
+                name: 'Apple Watch Ultra 2 Titanium',
+                img: 'https://via.placeholder.com/200x200?text=Apple+Watch',
+                categories: ['smart-watches', 'gadgets']
             },
             {
                 id: '2',
                 name: 'Fossil Watch Classic',
                 img: 'https://via.placeholder.com/200x200?text=Fossil+Watch',
-                categories: ['fossil', 'watches']
+                categories: ['watches']
             },
             {
                 id: '3',
-                name: 'Adidas Running Shoes',
-                img: 'https://via.placeholder.com/200x200?text=Adidas+Shoe',
-                categories: ['adidas', 'shoes']
+                name: 'AirPods Pro 2nd Gen',
+                img: 'https://via.placeholder.com/200x200?text=AirPods',
+                categories: ['airpods', 'gadgets']
             }
         ];
     }
@@ -657,50 +829,184 @@ class AdminCategoryManager {
 
     renderCategoriesTable() {
         const tbody = document.getElementById('categoriesTableBody');
+        const countHeader = document.querySelector('.categories-list-section h2');
+
         if (!tbody) return;
 
-        tbody.innerHTML = this.categories.map(category => `
-            <tr data-category-id="${category.id}">
-                <td>
-                    <div class="category-preview">
-                        <div class="category-preview-image" style="background-color: ${category.color || '#667eea'}">
-                            <img src="${category.image || category.icon || 'https://via.placeholder.com/40x40?text=' + (category.name ? category.name.charAt(0) : 'C')}" 
-                                 alt="${category.name || 'Category'}" 
-                                 style="width: 30px; height: 30px; border-radius: 6px; object-fit: cover;"
-                                 onerror="this.src='https://via.placeholder.com/40x40?text=' + '${category.name ? category.name.charAt(0) : 'C'}'">
+        // Add Save Order Button to Header if missing
+        if (countHeader && !document.getElementById('tableSaveOrderBtn')) {
+            countHeader.style.display = 'flex';
+            countHeader.style.justifyContent = 'space-between';
+            countHeader.style.alignItems = 'center';
+            countHeader.innerHTML = `
+                <span><i class="fas fa-list"></i> Existing Categories</span>
+                <button id="tableSaveOrderBtn" class="btn btn-primary btn-sm" onclick="adminCategoryManager.saveCategoryOrderFromTable()">
+                    <i class="fas fa-save"></i> Save Display Order
+                </button>
+            `;
+        }
+
+        // Add Order column header if missing
+        const headerRow = document.querySelector('.categories-table thead tr');
+        if (headerRow && !headerRow.querySelector('.order-header')) {
+            const orderHeader = document.createElement('th');
+            orderHeader.className = 'order-header';
+            orderHeader.style.width = '100px';
+            orderHeader.innerHTML = 'Order <i class="fas fa-sort" style="cursor:pointer;opacity:0.6" onclick="adminCategoryManager.reorderByTableInput()" title="Sort table by input numbers"></i>';
+            headerRow.insertBefore(orderHeader, headerRow.firstElementChild);
+        }
+
+        // Fetch and apply display order
+        this.fetchCurrentDisplayOrder().then(order => {
+            let sortedCats = [...this.categories].filter(c => c.id !== 'CONFIG_display_order'); // Filter config doc
+
+            // Sort categories based on saved order
+            if (order && order.length > 0) {
+                sortedCats.sort((a, b) => {
+                    const idA = a.id.toLowerCase();
+                    const idB = b.id.toLowerCase();
+                    let indexA = order.indexOf(idA);
+                    let indexB = order.indexOf(idB);
+                    if (indexA === -1) indexA = 9999;
+                    if (indexB === -1) indexB = 9999;
+                    return indexA - indexB;
+                });
+            }
+
+            tbody.innerHTML = sortedCats.map((category, index) => `
+                <tr data-category-id="${category.id}">
+                    <td>
+                        <input type="number" 
+                               class="form-control form-control-sm table-order-input" 
+                               value="${index + 1}" 
+                               min="1" 
+                               data-id="${category.id}"
+                               style="width: 60px; text-align: center;">
+                    </td>
+                    <td>
+                        <div class="category-preview">
+                            <div class="category-preview-image" style="background-color: ${category.color || '#667eea'}">
+                                <img src="${category.image || category.icon || 'https://via.placeholder.com/40x40?text=' + (category.name ? category.name.charAt(0) : 'C')}" 
+                                     alt="${category.name || 'Category'}" 
+                                     style="width: 30px; height: 30px; border-radius: 6px; object-fit: cover;"
+                                     onerror="this.src='https://via.placeholder.com/40x40?text=' + '${category.name ? category.name.charAt(0) : 'C'}'">
+                            </div>
+                            <span class="category-preview-name">${category.name || 'Unnamed Category'}</span>
                         </div>
-                        <span class="category-preview-name">${category.name || 'Unnamed Category'}</span>
-                    </div>
-                </td>
-                <td><strong>${category.name || 'Unnamed Category'}</strong></td>
-                <td>
-                    <img src="${category.image || category.icon || 'https://via.placeholder.com/40x40?text=' + (category.name ? category.name.charAt(0) : 'C')}" 
-                         alt="${category.name || 'Category'}" 
-                         style="width: 40px; height: 40px; border-radius: 8px; object-fit: cover;"
-                         onerror="this.src='https://via.placeholder.com/40x40?text=' + '${category.name ? category.name.charAt(0) : 'C'}'">
-                </td>
-                <td>
-                    <div class="color-preview" style="background-color: ${category.color || '#667eea'}"></div>
-                    <small style="display: block; margin-top: 4px;">${category.color || '#667eea'}</small>
-                </td>
-                <td>
-                    <span class="badge">${this.getProductCountForCategory(category.id)} products</span>
-                </td>
-                <td>
-                    <div class="actions-cell">
-                        <button class="action-btn btn-info" onclick="adminCategoryManager.viewCategoryProducts('${category.id}', '${category.name || 'Unnamed Category'}')">
-                            <i class="fas fa-eye"></i> View Products
-                        </button>
-                        <button class="action-btn btn-warning" onclick="adminCategoryManager.editCategory('${category.id}')">
-                            <i class="fas fa-edit"></i> Edit
-                        </button>
-                        <button class="action-btn btn-danger" onclick="adminCategoryManager.deleteCategory('${category.id}', '${category.name || 'Unnamed Category'}')">
-                            <i class="fas fa-trash"></i> Delete
-                        </button>
-                    </div>
-                </td>
-            </tr>
-        `).join('');
+                    </td>
+                    <td><strong>${category.name || 'Unnamed Category'}</strong></td>
+                    <td>
+                        <img src="${category.image || category.icon || 'https://via.placeholder.com/40x40?text=' + (category.name ? category.name.charAt(0) : 'C')}" 
+                             alt="${category.name || 'Category'}" 
+                             style="width: 40px; height: 40px; border-radius: 8px; object-fit: cover;"
+                             onerror="this.src='https://via.placeholder.com/40x40?text=' + '${category.name ? category.name.charAt(0) : 'C'}'">
+                    </td>
+                    <td>
+                        <div class="color-preview" style="background-color: ${category.color || '#667eea'}"></div>
+                        <small style="display: block; margin-top: 4px;">${category.color || '#667eea'}</small>
+                    </td>
+                    <td>
+                        <span class="badge">${this.getProductCountForCategory(category.id)} products</span>
+                    </td>
+                    <td>
+                        <div class="actions-cell">
+                            <button class="action-btn btn-info" onclick="adminCategoryManager.viewCategoryProducts('${category.id}', '${category.name || 'Unnamed Category'}')">
+                                <i class="fas fa-eye"></i> View Products
+                            </button>
+                            <button class="action-btn btn-warning" onclick="adminCategoryManager.editCategory('${category.id}')">
+                                <i class="fas fa-edit"></i> Edit
+                            </button>
+                            <button class="action-btn btn-danger" onclick="adminCategoryManager.deleteCategory('${category.id}', '${category.name || 'Unnamed Category'}')">
+                                <i class="fas fa-trash"></i> Delete
+                            </button>
+                        </div>
+                    </td>
+                </tr>
+            `).join('');
+        });
+    }
+
+    reorderByTableInput() {
+        const tbody = document.getElementById('categoriesTableBody');
+        const rows = [...tbody.querySelectorAll('tr')];
+
+        rows.sort((a, b) => {
+            const inputA = a.querySelector('.table-order-input');
+            const inputB = b.querySelector('.table-order-input');
+            const valA = parseInt(inputA.value) || 9999;
+            const valB = parseInt(inputB.value) || 9999;
+            return valA - valB;
+        });
+
+        rows.forEach(row => tbody.appendChild(row));
+
+        // Renumber to handle duplicates or gaps
+        rows.forEach((row, index) => {
+            const input = row.querySelector('.table-order-input');
+            input.value = index + 1;
+        });
+
+        this.showMessage('Table resorted. Click "Save Display Order" to apply.', 'info');
+    }
+
+    async saveCategoryOrderFromTable() {
+        const inputs = [...document.querySelectorAll('.table-order-input')];
+
+        // Sort inputs by their numeric value
+        inputs.sort((a, b) => (parseInt(a.value) || 9999) - (parseInt(b.value) || 9999));
+
+        // Extract IDs in sorted order (normalized to lowercase)
+        const newOrder = inputs.map(input => input.dataset.id.trim().toLowerCase());
+
+        console.log('💾 Saving category order:', newOrder);
+
+        const saveBtn = document.getElementById('tableSaveOrderBtn');
+        const originalText = saveBtn ? saveBtn.innerHTML : '<i class="fas fa-save"></i> Save Display Order';
+
+        if (saveBtn) {
+            saveBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Saving...';
+            saveBtn.disabled = true;
+        }
+
+        try {
+            if (typeof db !== 'undefined') {
+                await db.collection('category').doc('CONFIG_display_order').set({
+                    order: newOrder,
+                    updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+                }, { merge: true });
+
+                if (saveBtn) {
+                    saveBtn.innerHTML = '<i class="fas fa-check"></i> Saved!';
+                    saveBtn.classList.remove('btn-primary');
+                    saveBtn.classList.add('btn-success');
+                }
+
+                this.showMessage('Order saved successfully!', 'success');
+
+                setTimeout(() => {
+                    if (saveBtn) {
+                        saveBtn.innerHTML = originalText;
+                        saveBtn.classList.remove('btn-success');
+                        saveBtn.classList.add('btn-primary');
+                        saveBtn.disabled = false;
+                    }
+                }, 2000);
+
+            } else {
+                this.showMessage('Cannot save: Firebase not available.', 'error');
+                if (saveBtn) {
+                    saveBtn.innerHTML = 'Error';
+                    saveBtn.disabled = false;
+                }
+            }
+        } catch (error) {
+            console.error('Error saving order:', error);
+            this.showMessage('Failed to save order: ' + error.message, 'error');
+            if (saveBtn) {
+                saveBtn.innerHTML = 'Error';
+                saveBtn.disabled = false;
+            }
+        }
     }
 
     renderProductsList() {
@@ -713,9 +1019,9 @@ class AdminCategoryManager {
                 <div class="product-item ${isSelected ? 'selected' : ''}" 
                      data-product-id="${product.id}" 
                      onclick="adminCategoryManager.selectProduct('${product.id}')">
-                    <img src="${product.img || product.imgUrl?.[0] || 'Logo/1000163691.jpg'}" 
+                    <img src="${product.img || product.imgUrl?.[0] || '../Logo/VEXIOR_logo.png'}" 
                          alt="${product.name}" 
-                         onerror="this.src='../Logo/1000163691.jpg'">
+                         onerror="this.src='../Logo/VEXIOR_logo.png'">
                     <div class="product-item-name">${product.name}</div>
                 </div>
             `;
@@ -861,7 +1167,7 @@ class AdminCategoryManager {
             productsHTML = `
                 <div class="category-products-grid">
                     ${products.map(product => {
-                const firstImage = (product.imgUrl && product.imgUrl[0]) || product.img || '../Logo/1000163691.jpg';
+                const firstImage = (product.imgUrl && product.imgUrl[0]) || product.img || '../Logo/VEXIOR_logo.png';
                 const price = product.newPrice || product.price || 'N/A';
                 const oldPrice = product.oldPrice;
 
@@ -871,7 +1177,7 @@ class AdminCategoryManager {
                 return `
                             <div class="category-product-card">
                                 <div class="category-product-image">
-                                    <img src="${firstImage}" alt="${product.name}" onerror="this.src='../Logo/1000163691.jpg'">
+                                    <img src="${firstImage}" alt="${product.name}" onerror="this.src='../Logo/VEXIOR_logo.png'">
                                     ${isOutOfStock ? '<div class="out-of-stock-badge">Out of Stock</div>' : ''}
                                 </div>
                                 <div class="category-product-info">
@@ -1093,9 +1399,9 @@ class AdminCategoryManager {
                         <h4>1 Product Selected</h4>
                         <div class="selected-products-list">
                             <div class="selected-product-item">
-                                <img src="${product.img || product.imgUrl?.[0] || '../Logo/1000163691.jpg'}" 
+                                <img src="${product.img || product.imgUrl?.[0] || '../Logo/VEXIOR_logo.png'}" 
                                      alt="${product.name}"
-                                     onerror="this.src='../Logo/1000163691.jpg'">
+                                     onerror="this.src='../Logo/VEXIOR_logo.png'">
                                 <span>${product.name}</span>
                             </div>
                         </div>
@@ -1109,9 +1415,9 @@ class AdminCategoryManager {
                 .slice(0, 5) // Show max 5 products
                 .map(product => `
                     <div class="selected-product-item">
-                        <img src="${product.img || product.imgUrl?.[0] || '../Logo/1000163691.jpg'}" 
+                        <img src="${product.img || product.imgUrl?.[0] || '../Logo/VEXIOR_logo.png'}" 
                              alt="${product.name}"
-                             onerror="this.src='../Logo/1000163691.jpg'">
+                             onerror="this.src='../Logo/VEXIOR_logo.png'">
                         <span>${product.name}</span>
                     </div>
                 `).join('');

@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -12,6 +13,7 @@
             padding: 20px;
             background-color: #f8f9fa;
         }
+
         .header {
             text-align: center;
             margin-bottom: 30px;
@@ -20,34 +22,40 @@
             color: white;
             border-radius: 10px;
         }
+
         .section {
             background: white;
             padding: 25px;
             border-radius: 10px;
             margin: 20px 0;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
         }
+
         .product-list {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
             gap: 15px;
             margin-top: 20px;
         }
+
         .product-item {
             padding: 15px;
             border: 1px solid #ddd;
             border-radius: 8px;
             background: #f9f9f9;
         }
+
         .product-item h4 {
             margin: 0 0 10px 0;
             color: #333;
         }
+
         .product-item p {
             margin: 5px 0;
             font-size: 0.9em;
             color: #666;
         }
+
         button {
             background: #8b5cf6;
             color: white;
@@ -59,15 +67,18 @@
             margin: 5px;
             transition: all 0.3s;
         }
+
         button:hover {
             background: #7c3aed;
             transform: translateY(-2px);
         }
+
         button:disabled {
             background: #ccc;
             cursor: not-allowed;
             transform: none;
         }
+
         .success {
             background: #d4edda;
             color: #155724;
@@ -75,6 +86,7 @@
             border-radius: 8px;
             margin: 15px 0;
         }
+
         .error {
             background: #f8d7da;
             color: #721c24;
@@ -82,6 +94,7 @@
             border-radius: 8px;
             margin: 15px 0;
         }
+
         .status {
             padding: 10px;
             border-radius: 6px;
@@ -90,6 +103,7 @@
         }
     </style>
 </head>
+
 <body>
     <div class="header">
         <h1>🔥 Today's Offer Manager</h1>
@@ -134,31 +148,78 @@
         firebase.initializeApp(firebaseConfig);
         const db = firebase.firestore();
 
+        let allLoadedProducts = [];
+
+        // Parse REST values
+        function parseRestVal(v) {
+            if (!v) return null;
+            if ('stringValue' in v) return v.stringValue;
+            if ('integerValue' in v) return parseInt(v.integerValue, 10);
+            if ('doubleValue' in v) return parseFloat(v.doubleValue);
+            if ('booleanValue' in v) return v.booleanValue;
+            if ('arrayValue' in v) return (v.arrayValue.values || []).map(parseRestVal);
+            return null;
+        }
+
+        async function fetchAllProductsRest() {
+            let all = [];
+            let pageToken = null;
+            do {
+                let url = 'https://firestore.googleapis.com/v1/projects/wackykicks-65cbe/databases/(default)/documents/products?pageSize=100';
+                if (pageToken) url += '&pageToken=' + encodeURIComponent(pageToken);
+                const res = await fetch(url);
+                if (!res.ok) break;
+                const data = await res.json();
+                const docs = (data.documents || []).map(d => {
+                    const id = d.name ? d.name.split('/').pop() : '';
+                    const fields = d.fields || {};
+                    const item = { id };
+                    for (const k of Object.keys(fields)) item[k] = parseRestVal(fields[k]);
+                    return item;
+                });
+                all = all.concat(docs);
+                pageToken = data.nextPageToken || null;
+            } while (pageToken);
+            return all;
+        }
+
+        function checkIsOffer(product) {
+            if (!product) return false;
+            if (product.category === 'today offer') return true;
+            if (Array.isArray(product.categories)) {
+                return product.categories.some(c => typeof c === 'string' && (c.toLowerCase().trim() === 'today offer' || c.toLowerCase().trim() === "today's offer"));
+            }
+            return false;
+        }
+
         // Load current today's offers
         async function loadTodaysOffers() {
             const container = document.getElementById('currentOffers');
             container.innerHTML = '<p>Loading current offers...</p>';
 
             try {
-                const snapshot = await db.collection("products").where("category", "==", "today offer").get();
-                
-                if (snapshot.empty) {
+                if (allLoadedProducts.length === 0) {
+                    allLoadedProducts = await fetchAllProductsRest();
+                }
+
+                const offers = allLoadedProducts.filter(checkIsOffer);
+
+                if (offers.length === 0) {
                     container.innerHTML = '<p>No products currently in today\'s offers.</p>';
                     return;
                 }
 
                 let html = `<div class="product-list">`;
-                snapshot.forEach(doc => {
-                    const product = doc.data();
-                    const discount = product.oldPrice && product.newPrice ? 
-                        Math.round(((parseFloat(product.oldPrice) - parseFloat(product.newPrice)) / parseFloat(product.oldPrice)) * 100) : 0;
-                    
+                offers.forEach(product => {
+                    const discount = product.oldPrice && (product.newPrice || product.price) ?
+                        Math.round(((parseFloat(product.oldPrice) - parseFloat(product.newPrice || product.price)) / parseFloat(product.oldPrice)) * 100) : 0;
+
                     html += `
                         <div class="product-item">
                             <h4>${product.name}</h4>
-                            <p><strong>Price:</strong> ₹${product.newPrice} ${product.oldPrice ? `(was ₹${product.oldPrice})` : ''}</p>
+                            <p><strong>Price:</strong> ₹${product.newPrice || product.price} ${product.oldPrice ? `(was ₹${product.oldPrice})` : ''}</p>
                             ${discount > 0 ? `<p><strong>Discount:</strong> ${discount}% OFF</p>` : ''}
-                            <button onclick="removeFromOffers('${doc.id}', '${product.name}')">Remove from Offers</button>
+                            <button onclick="removeFromOffers('${product.id}', '${product.name.replace(/'/g, "\\'")}')">Remove from Offers</button>
                         </div>
                     `;
                 });
@@ -175,27 +236,29 @@
             container.innerHTML = '<p>Loading all products...</p>';
 
             try {
-                const snapshot = await db.collection("products").get();
-                
-                if (snapshot.empty) {
+                if (allLoadedProducts.length === 0) {
+                    allLoadedProducts = await fetchAllProductsRest();
+                }
+
+                if (allLoadedProducts.length === 0) {
                     container.innerHTML = '<p>No products found in database.</p>';
                     return;
                 }
 
                 let html = `<div class="product-list">`;
-                snapshot.forEach(doc => {
-                    const product = doc.data();
-                    const isOffer = product.category === "today offer";
-                    
+                allLoadedProducts.forEach(product => {
+                    const isOffer = checkIsOffer(product);
+                    const cats = Array.isArray(product.categories) ? product.categories.join(', ') : (product.category || 'No category');
+
                     html += `
                         <div class="product-item">
                             <h4>${product.name}</h4>
-                            <p><strong>Category:</strong> ${product.category || 'No category'}</p>
-                            <p><strong>Price:</strong> ₹${product.newPrice} ${product.oldPrice ? `(was ₹${product.oldPrice})` : ''}</p>
-                            ${isOffer ? 
-                                `<button disabled>Already in Today's Offers</button>` :
-                                `<button onclick="addToOffers('${doc.id}', '${product.name}')">Add to Today's Offers</button>`
-                            }
+                            <p><strong>Category:</strong> ${cats}</p>
+                            <p><strong>Price:</strong> ₹${product.newPrice || product.price} ${product.oldPrice ? `(was ₹${product.oldPrice})` : ''}</p>
+                            ${isOffer ?
+                            `<button disabled>Already in Today's Offers</button>` :
+                            `<button onclick="addToOffers('${product.id}', '${product.name.replace(/'/g, "\\'")}')">Add to Today's Offers</button>`
+                        }
                         </div>
                     `;
                 });
@@ -209,18 +272,28 @@
         // Add product to today's offers
         async function addToOffers(productId, productName) {
             try {
+                const prod = allLoadedProducts.find(p => p.id === productId);
+                let cats = (prod && Array.isArray(prod.categories)) ? [...prod.categories] : [];
+                if (!cats.includes('today offer')) cats.push('today offer');
+
                 await db.collection("products").doc(productId).update({
-                    category: "today offer"
+                    category: "today offer",
+                    categories: cats
                 });
-                
-                document.getElementById('actionResult').innerHTML = 
+
+                if (prod) {
+                    prod.category = 'today offer';
+                    prod.categories = cats;
+                }
+
+                document.getElementById('actionResult').innerHTML =
                     `<div class="success">✅ Added "${productName}" to today's offers!</div>`;
-                
+
                 // Refresh both lists
                 loadTodaysOffers();
                 loadAllProducts();
             } catch (error) {
-                document.getElementById('actionResult').innerHTML = 
+                document.getElementById('actionResult').innerHTML =
                     `<div class="error">❌ Error adding product: ${error.message}</div>`;
             }
         }
@@ -228,18 +301,27 @@
         // Remove product from today's offers
         async function removeFromOffers(productId, productName) {
             try {
+                const prod = allLoadedProducts.find(p => p.id === productId);
+                let cats = (prod && Array.isArray(prod.categories)) ? prod.categories.filter(c => c !== 'today offer' && c !== "today's offer") : [];
+
                 await db.collection("products").doc(productId).update({
-                    category: firebase.firestore.FieldValue.delete()
+                    category: firebase.firestore.FieldValue.delete(),
+                    categories: cats
                 });
-                
-                document.getElementById('actionResult').innerHTML = 
+
+                if (prod) {
+                    delete prod.category;
+                    prod.categories = cats;
+                }
+
+                document.getElementById('actionResult').innerHTML =
                     `<div class="success">✅ Removed "${productName}" from today's offers!</div>`;
-                
+
                 // Refresh both lists
                 loadTodaysOffers();
                 loadAllProducts();
             } catch (error) {
-                document.getElementById('actionResult').innerHTML = 
+                document.getElementById('actionResult').innerHTML =
                     `<div class="error">❌ Error removing product: ${error.message}</div>`;
             }
         }
@@ -252,10 +334,10 @@
             try {
                 // First, ensure the "Today Offer" category exists in Firebase
                 await createTodayOfferCategory();
-                
+
                 // Get first 3 products and add them to today's offers
                 const snapshot = await db.collection("products").limit(3).get();
-                
+
                 if (snapshot.empty) {
                     container.innerHTML = '<div class="error">No products found to create demo offers.</div>';
                     return;
@@ -263,7 +345,7 @@
 
                 let count = 0;
                 const promises = [];
-                
+
                 snapshot.forEach(doc => {
                     promises.push(
                         db.collection("products").doc(doc.id).update({
@@ -274,7 +356,7 @@
                 });
 
                 await Promise.all(promises);
-                
+
                 container.innerHTML = `<div class="success">✅ Created "Today Offer" category and added ${count} demo products!</div>`;
                 loadTodaysOffers();
             } catch (error) {
@@ -287,7 +369,7 @@
             try {
                 // Check if category already exists
                 const categorySnapshot = await db.collection("category").where("name", "==", "Today's Offers").get();
-                
+
                 if (!categorySnapshot.empty) {
                     console.log('Today Offer category already exists');
                     return;
@@ -335,7 +417,7 @@
 
             try {
                 const snapshot = await db.collection("products").where("category", "==", "today offer").get();
-                
+
                 if (snapshot.empty) {
                     container.innerHTML = '<div class="success">No offers to clear.</div>';
                     return;
@@ -351,7 +433,7 @@
                 });
 
                 await Promise.all(promises);
-                
+
                 container.innerHTML = `<div class="success">✅ Cleared all today's offers!</div>`;
                 loadTodaysOffers();
             } catch (error) {
@@ -365,4 +447,5 @@
         });
     </script>
 </body>
+
 </html>
