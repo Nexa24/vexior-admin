@@ -102,6 +102,51 @@ async function fetchAdminProductsViaRest(onBatchLoaded = null) {
     return allFetched;
 }
 
+function toCategoryRestDoc(obj) {
+    const fields = {};
+    for (const k of Object.keys(obj)) {
+        if (k === 'id' || k === 'firebaseId' || obj[k] === undefined) continue;
+        const v = obj[k];
+        if (typeof v === 'string') fields[k] = { stringValue: v };
+        else if (typeof v === 'number') fields[k] = Number.isInteger(v) ? { integerValue: v.toString() } : { doubleValue: v };
+        else if (typeof v === 'boolean') fields[k] = { booleanValue: v };
+        else if (Array.isArray(v)) fields[k] = { arrayValue: { values: v.map(item => ({ stringValue: String(item) })) } };
+        else fields[k] = { stringValue: String(v) };
+    }
+    return { fields };
+}
+
+async function restSaveCategory(categoryData, categoryId = null) {
+    if (categoryId) {
+        const queryMask = Object.keys(categoryData).filter(k => k !== 'id' && k !== 'firebaseId' && categoryData[k] !== undefined)
+            .map(k => `updateMask.fieldPaths=${encodeURIComponent(k)}`).join('&');
+        const res = await fetch(`https://firestore.googleapis.com/v1/projects/wackykicks-65cbe/databases/(default)/documents/category/${categoryId}?${queryMask}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(toCategoryRestDoc(categoryData))
+        });
+        if (!res.ok) throw new Error(`REST PATCH returned HTTP ${res.status}`);
+        return categoryId;
+    } else {
+        const res = await fetch(`https://firestore.googleapis.com/v1/projects/wackykicks-65cbe/databases/(default)/documents/category`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(toCategoryRestDoc(categoryData))
+        });
+        if (!res.ok) throw new Error(`REST POST returned HTTP ${res.status}`);
+        const data = await res.json();
+        return data.name ? data.name.split('/').pop() : Date.now().toString();
+    }
+}
+
+async function restDeleteCategory(categoryId) {
+    const res = await fetch(`https://firestore.googleapis.com/v1/projects/wackykicks-65cbe/databases/(default)/documents/category/${categoryId}`, {
+        method: 'DELETE'
+    });
+    if (!res.ok) throw new Error(`REST DELETE returned HTTP ${res.status}`);
+    return true;
+}
+
 // Admin Categories Management
 class AdminCategoryManager {
     constructor() {
@@ -729,29 +774,14 @@ class AdminCategoryManager {
                 success = await categoryManager.addCategory(categoryData);
                 console.log('CategoryManager result:', success);
             }
-            // Method 2: Try direct Firebase
-            else if (typeof db !== 'undefined') {
-                console.log('Using direct Firebase add');
-                const docRef = await db.collection('category').add({
-                    name: categoryData.name,
-                    image: categoryData.image,
-                    color: categoryData.color,
-                    description: categoryData.description,
-                    createdAt: categoryData.createdAt
-                });
-                console.log('Firebase docRef:', docRef);
-                categoryData.id = docRef.id;
-                success = true;
-            }
-            // Method 3: Local storage fallback
-            else {
-                console.log('Using local storage fallback');
-                let localCategories = JSON.parse(localStorage.getItem('categories') || '[]');
-                localCategories.push(categoryData);
-                localStorage.setItem('categories', JSON.stringify(localCategories));
+            // Method 2: Direct REST API fallback
+            if (!success) {
+                console.log('Using direct REST API add fallback');
+                const docId = await restSaveCategory(categoryData, null);
+                categoryData.id = docId;
+                categoryData.firebaseId = docId;
                 this.categories.push(categoryData);
                 success = true;
-                console.log('Added to local storage');
             }
 
             if (success) {
@@ -799,14 +829,17 @@ class AdminCategoryManager {
                 console.log('Using categoryManager.updateCategory');
                 success = await categoryManager.updateCategory(categoryId, updateData);
                 console.log('CategoryManager result:', success);
-            } else if (typeof db !== 'undefined') {
-                // Direct Firebase call
-                console.log('Using direct Firebase update');
-                await db.collection('category').doc(categoryId).update(updateData);
+            }
+
+            // Direct REST API fallback
+            if (!success) {
+                console.log('Using direct REST API update fallback');
+                await restSaveCategory(updateData, categoryId);
+                const categoryIndex = this.categories.findIndex(cat => cat.id === categoryId);
+                if (categoryIndex > -1) {
+                    this.categories[categoryIndex] = { ...this.categories[categoryIndex], ...updateData };
+                }
                 success = true;
-                console.log('Firebase update completed');
-            } else {
-                console.log('No update method available');
             }
 
             if (success) {
@@ -1263,9 +1296,13 @@ class AdminCategoryManager {
             // Try using categoryManager first
             if (typeof categoryManager !== 'undefined') {
                 success = await categoryManager.deleteCategory(categoryId);
-            } else if (typeof db !== 'undefined') {
-                // Direct Firebase call
-                await db.collection('category').doc(categoryId).delete();
+            }
+
+            // Direct REST API fallback
+            if (!success) {
+                console.log('Using direct REST API delete fallback');
+                await restDeleteCategory(categoryId);
+                this.categories = this.categories.filter(cat => cat.id !== categoryId);
                 success = true;
             }
 

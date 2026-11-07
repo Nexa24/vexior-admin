@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <title>Manage Products | Vexior Admin</title>
-    <link rel="icon" href="../Logo/VEXIOR_logo.png" type="image/png">
+    <link rel="icon" href="../Logo/VEXIOR_logo.png" onerror="this.onerror=null;this.href='Logo/VEXIOR_logo.png';" type="image/png">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css" rel="stylesheet">
     <style>
@@ -1399,7 +1399,7 @@
             }
         }
     </style>
-    <link rel="stylesheet" href="../floating-alerts.css">
+    <link rel="stylesheet" href="../floating-alerts.css" onerror="this.onerror=null;this.href='floating-alerts.css';">
 </head>
 
 <body>
@@ -1426,7 +1426,7 @@
         <!-- Header Section -->
         <div class="admin-header">
             <a href="../index.html" style="display: inline-block; margin-bottom: 15px;">
-                <img src="../Logo/VEXIOR_logo.png" alt="Vexior" style="height: 48px; object-fit: contain;">
+                <img src="../Logo/VEXIOR_logo.png" onerror="this.onerror=null;this.src='Logo/VEXIOR_logo.png';" alt="Vexior" style="height: 48px; object-fit: contain;">
             </a>
             <h1><i class="fas fa-cogs"></i> Product Management</h1>
             <p class="subtitle">Add, edit, and manage your store products with ease</p>
@@ -2555,6 +2555,109 @@
             });
         }
 
+        // Convert JavaScript values/objects to Firestore REST format
+        function toFirestoreRestValue(val) {
+            if (val === null || val === undefined) return { nullValue: null };
+            if (typeof val === 'string') return { stringValue: val };
+            if (typeof val === 'number') {
+                if (Number.isInteger(val)) return { integerValue: val.toString() };
+                return { doubleValue: val };
+            }
+            if (typeof val === 'boolean') return { booleanValue: val };
+            if (Array.isArray(val)) {
+                return { arrayValue: { values: val.map(toFirestoreRestValue) } };
+            }
+            if (typeof val === 'object') {
+                const fields = {};
+                for (const k of Object.keys(val)) {
+                    if (val[k] !== undefined) {
+                        fields[k] = toFirestoreRestValue(val[k]);
+                    }
+                }
+                return { mapValue: { fields } };
+            }
+            return { stringValue: String(val) };
+        }
+
+        function toFirestoreRestDoc(obj) {
+            const fields = {};
+            for (const key of Object.keys(obj)) {
+                if (key === 'id' || key === 'img' || obj[key] === undefined) continue;
+                fields[key] = toFirestoreRestValue(obj[key]);
+            }
+            return { fields };
+        }
+
+        // Resilient Product Save (Firebase SDK with direct REST API fallback)
+        async function saveProductToFirestore(productId, productData, isEdit) {
+            // Attempt 1: Try Firebase SDK with a 2.5-second timeout
+            try {
+                const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Firebase SDK timeout')), 2500));
+                if (isEdit) {
+                    await Promise.race([updateDoc(doc(db, "products", productId), productData), timeoutPromise]);
+                    return { success: true, id: productId };
+                } else {
+                    const docRef = await Promise.race([addDoc(collection(db, "products"), productData), timeoutPromise]);
+                    return { success: true, id: docRef.id };
+                }
+            } catch (sdkErr) {
+                console.warn('[Admin] Firebase SDK save failed or timed out, switching to direct REST API fallback:', sdkErr.message || sdkErr);
+            }
+
+            // Attempt 2: Direct Google Cloud REST API (100% reliable)
+            try {
+                const restDoc = toFirestoreRestDoc(productData);
+                if (isEdit) {
+                    const fieldMask = Object.keys(productData).filter(k => k !== 'id' && k !== 'img' && productData[k] !== undefined)
+                        .map(k => `updateMask.fieldPaths=${encodeURIComponent(k)}`).join('&');
+                    const res = await fetch(`https://firestore.googleapis.com/v1/projects/wackykicks-65cbe/databases/(default)/documents/products/${productId}?${fieldMask}`, {
+                        method: 'PATCH',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(restDoc)
+                    });
+                    if (!res.ok) throw new Error(`REST PATCH returned HTTP ${res.status}`);
+                    return { success: true, id: productId };
+                } else {
+                    const res = await fetch(`https://firestore.googleapis.com/v1/projects/wackykicks-65cbe/databases/(default)/documents/products`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(restDoc)
+                    });
+                    if (!res.ok) throw new Error(`REST POST returned HTTP ${res.status}`);
+                    const data = await res.json();
+                    const newId = data.name ? data.name.split('/').pop() : Date.now().toString();
+                    return { success: true, id: newId };
+                }
+            } catch (restErr) {
+                console.error('[Admin] REST save also failed:', restErr);
+                throw restErr;
+            }
+        }
+
+        // Resilient Product Delete (Firebase SDK with direct REST API fallback)
+        async function deleteProductFromFirestore(productId) {
+            // Attempt 1: Try Firebase SDK with a 2.5-second timeout
+            try {
+                const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Firebase SDK timeout')), 2500));
+                await Promise.race([deleteDoc(doc(db, "products", productId)), timeoutPromise]);
+                return true;
+            } catch (sdkErr) {
+                console.warn('[Admin] Firebase SDK delete failed or timed out, switching to direct REST fallback:', sdkErr.message || sdkErr);
+            }
+
+            // Attempt 2: Direct Google Cloud REST API
+            try {
+                const res = await fetch(`https://firestore.googleapis.com/v1/projects/wackykicks-65cbe/databases/(default)/documents/products/${productId}`, {
+                    method: 'DELETE'
+                });
+                if (!res.ok) throw new Error(`REST DELETE returned HTTP ${res.status}`);
+                return true;
+            } catch (restErr) {
+                console.error('[Admin] REST delete failed:', restErr);
+                throw restErr;
+            }
+        }
+
         // Submit product (add or update)
         window.submitProduct = async () => {
             const name = nameInput.value.trim();
@@ -2571,16 +2674,31 @@
                     .filter(img => !img.loading && img.base64)
                     .map(img => img.base64);
             } else {
-                imgUrl = document.getElementById("multiImageInput").value
-                    .split(',')
-                    .map(url => url.trim())
-                    .filter(url => url);
+                const multiInput = document.getElementById("multiImageInput");
+                if (multiInput && multiInput.value) {
+                    imgUrl = multiInput.value
+                        .split(',')
+                        .map(url => url.trim())
+                        .filter(url => url);
+                }
+            }
+
+            // In edit mode: if user didn't modify images, retain existing images
+            if (imgUrl.length === 0 && editMode && editingProductId) {
+                const existing = allProducts.find(p => p.id === editingProductId);
+                if (existing) {
+                    if (Array.isArray(existing.imgUrl) && existing.imgUrl.length > 0) {
+                        imgUrl = existing.imgUrl;
+                    } else if (existing.img) {
+                        imgUrl = [existing.img];
+                    }
+                }
             }
 
             const sizes = sizesInput.value.split(",").map(s => s.trim()).filter(s => s);
-            const colors = selectedColors; // Use the selectedColors array instead
+            const colors = selectedColors;
             const description = descriptionInput.value.trim();
-            const categories = getSelectedProductCategories(); // Get selected categories
+            const categories = getSelectedProductCategories();
 
             if (!name || !oldPrice || !newPrice || imgUrl.length === 0) {
                 if (window.FloatingAlertManager) {
@@ -2591,8 +2709,13 @@
                 return;
             }
 
+            const submitBtn = document.querySelector(".submit-btn");
+            if (submitBtn) {
+                submitBtn.innerText = editMode ? "Updating..." : "Adding...";
+                submitBtn.disabled = true;
+            }
+
             try {
-                // Prepare product data, only include stock if it's defined
                 const productData = {
                     name,
                     price,
@@ -2605,13 +2728,12 @@
                     categories
                 };
 
-                // Only add stock field if it's defined
                 if (stock !== undefined) {
                     productData.stock = stock;
                 }
 
                 if (editMode && editingProductId) {
-                    await updateDoc(doc(db, "products", editingProductId), productData);
+                    await saveProductToFirestore(editingProductId, productData, true);
                     const idx = allProducts.findIndex(p => p.id === editingProductId);
                     if (idx !== -1) {
                         allProducts[idx] = { id: editingProductId, ...productData };
@@ -2625,11 +2747,10 @@
                         alert("Product updated successfully!");
                     }
                 } else {
-                    // Add timestamp for new products
                     productData.createdAt = new Date().toISOString();
-                    const docRef = await addDoc(collection(db, "products"), productData);
+                    const result = await saveProductToFirestore(null, productData, false);
                     const newProd = {
-                        id: docRef.id,
+                        id: result.id,
                         ...productData,
                         img: Array.isArray(productData.imgUrl) ? productData.imgUrl[0] : (productData.imgUrl || '')
                     };
@@ -2643,22 +2764,28 @@
                         alert("Product added successfully!");
                     }
                 }
+
+                resetForm();
             } catch (err) {
+                console.error('[Admin] Error saving product:', err);
                 if (window.FloatingAlertManager) {
                     window.alerts.error("Error saving product: " + err.message, 'Save Error');
                 } else {
                     alert("Error saving product: " + err.message);
                 }
+            } finally {
+                if (submitBtn) {
+                    submitBtn.innerText = editMode ? "Update Product" : "Add Product";
+                    submitBtn.disabled = false;
+                }
             }
-
-            resetForm();
         };
 
         // Delete product
         window.deleteProduct = async (id) => {
             if (!confirm("Are you sure you want to delete this product?")) return;
             try {
-                await deleteDoc(doc(db, "products", id));
+                await deleteProductFromFirestore(id);
                 allProducts = allProducts.filter(p => p.id !== id);
                 await setCachedProductsAsync(allProducts);
                 displayProducts(allProducts);
@@ -2669,6 +2796,7 @@
                     alert("Product deleted successfully!");
                 }
             } catch (err) {
+                console.error('[Admin] Error deleting product:', err);
                 if (window.FloatingAlertManager) {
                     window.alerts.error("Error deleting product: " + err.message, 'Delete Error');
                 } else {
@@ -2713,10 +2841,11 @@
                 }
                 return;
             }
-            nameInput.value = product.name;
+
+            nameInput.value = product.name || "";
             oldPriceInput.value = product.oldPrice || "";
-            newPriceInput.value = product.newPrice || "";
-            stockInput.value = product.stock || 0;
+            newPriceInput.value = product.newPrice || product.price || "";
+            stockInput.value = product.stock !== undefined ? product.stock : 0;
             sizesInput.value = (product.sizes || []).join(", ");
             descriptionInput.value = product.description || "";
 
@@ -2724,20 +2853,16 @@
             const productColors = product.colors || [];
             selectedColors = [];
 
-            // Convert colors to new format if needed
             productColors.forEach(colorData => {
                 if (typeof colorData === 'string') {
-                    // Handle both old format and new "name:hex" format
                     if (colorData.includes(':')) {
                         const [name, hex] = colorData.split(':');
                         selectedColors.push({ name: name.trim(), hex: hex.trim() });
                     } else {
-                        // Old format - try to get hex from predefined colors
                         const hex = getColorHexForAdmin(colorData);
                         selectedColors.push({ name: colorData, hex: hex });
                     }
                 } else if (colorData && colorData.name && colorData.hex) {
-                    // Already in new format
                     selectedColors.push(colorData);
                 }
             });
@@ -2750,43 +2875,64 @@
                 setProductCategories(product.categories);
             }
 
-            // Handle images - check if they're base64 or URLs
-            const images = product.imgUrl || [];
-            const hasBase64 = images.some(url => url.startsWith('data:image'));
+            // Handle images safely (support array, string, or empty)
+            let images = [];
+            if (Array.isArray(product.imgUrl)) {
+                images = product.imgUrl.filter(Boolean);
+            } else if (typeof product.imgUrl === 'string' && product.imgUrl) {
+                images = [product.imgUrl];
+            } else if (product.img) {
+                images = Array.isArray(product.img) ? product.img : [product.img];
+            }
+
+            const hasBase64 = images.some(url => typeof url === 'string' && url.startsWith('data:image'));
 
             if (hasBase64) {
-                // Switch to file upload method and show images
                 currentUploadMethod = 'file';
                 document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
-                document.querySelector('.tab-btn').classList.add('active');
-                document.getElementById('fileUploadSection').classList.add('active');
-                document.getElementById('urlUploadSection').classList.remove('active');
+                const fileTab = document.querySelectorAll('.tab-btn')[0];
+                if (fileTab) fileTab.classList.add('active');
+                const fileSec = document.getElementById('fileUploadSection');
+                if (fileSec) fileSec.classList.add('active');
+                const urlSec = document.getElementById('urlUploadSection');
+                if (urlSec) urlSec.classList.remove('active');
 
-                // Load base64 images into uploaded array
                 uploadedImages = images.map((base64, index) => ({
                     id: Date.now() + index,
                     base64: base64,
                     name: `Image ${index + 1}`,
-                    size: Math.round((base64.length * 3) / 4),
-                    compressedSize: Math.round((base64.length * 3) / 4)
+                    size: typeof base64 === 'string' ? Math.round((base64.length * 3) / 4) : 0,
+                    compressedSize: typeof base64 === 'string' ? Math.round((base64.length * 3) / 4) : 0
                 }));
                 updateImagePreview();
             } else {
-                // Use URL method
                 currentUploadMethod = 'url';
                 document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
-                document.querySelectorAll('.tab-btn')[1].classList.add('active');
-                document.getElementById('fileUploadSection').classList.remove('active');
-                document.getElementById('urlUploadSection').classList.add('active');
+                const urlTab = document.querySelectorAll('.tab-btn')[1];
+                if (urlTab) urlTab.classList.add('active');
+                const fileSec = document.getElementById('fileUploadSection');
+                if (fileSec) fileSec.classList.remove('active');
+                const urlSec = document.getElementById('urlUploadSection');
+                if (urlSec) urlSec.classList.add('active');
 
-                document.getElementById("multiImageInput").value = images.join(', ');
+                const multiInput = document.getElementById("multiImageInput");
+                if (multiInput) multiInput.value = images.join(', ');
                 uploadedImages = [];
                 updateImagePreview();
             }
 
             editMode = true;
             editingProductId = id;
-            document.querySelector(".submit-btn").innerText = "Update Product";
+            const submitBtn = document.querySelector(".submit-btn");
+            if (submitBtn) submitBtn.innerText = "Update Product";
+
+            // Smoothly scroll to the form card so the admin immediately sees the edit form
+            const adminCard = document.querySelector(".admin-card, form, #productForm");
+            if (adminCard) {
+                adminCard.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            } else {
+                window.scrollTo({ top: 0, behavior: 'smooth' });
+            }
         };
 
         // Helper function to get hex colors for admin (similar to product page)
@@ -3095,7 +3241,7 @@
         }
     </script>
 
-    <script src="../floating-alerts.js"></script>
+    <script src="../floating-alerts.js" onerror="this.onerror=null;this.src='floating-alerts.js';"></script>
 
 
 </body>
