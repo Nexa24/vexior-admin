@@ -274,35 +274,32 @@
             try {
                 const prod = allLoadedProducts.find(p => p.id === productId);
                 let cats = (prod && Array.isArray(prod.categories)) ? [...prod.categories] : [];
-                if (!cats.includes('today offer')) cats.push('today offer');
+                if (!cats.some(c => typeof c === 'string' && c.toLowerCase().trim() === 'today offer')) {
+                    cats.push('today offer');
+                }
 
-                let updated = false;
+                // Direct REST PATCH (instant 150ms)
+                const catVals = cats.map(c => ({ stringValue: c }));
+                const res = await fetch(`https://firestore.googleapis.com/v1/projects/wackykicks-65cbe/databases/(default)/documents/products/${productId}?updateMask.fieldPaths=category&updateMask.fieldPaths=categories`, {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        fields: {
+                            category: { stringValue: 'today offer' },
+                            categories: { arrayValue: { values: catVals } }
+                        }
+                    })
+                });
+
+                if (!res.ok) throw new Error(`REST PATCH returned HTTP ${res.status}`);
+
+                // Background SDK update
                 try {
-                    const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 2500));
-                    await Promise.race([
-                        db.collection("products").doc(productId).update({
-                            category: "today offer",
-                            categories: cats
-                        }),
-                        timeoutPromise
-                    ]);
-                    updated = true;
-                } catch (sdkErr) {
-                    console.warn('[Admin] SDK addToOffers failed, using direct REST fallback:', sdkErr);
-                }
-
-                if (!updated) {
-                    await fetch(`https://firestore.googleapis.com/v1/projects/wackykicks-65cbe/databases/(default)/documents/products/${productId}?updateMask.fieldPaths=category&updateMask.fieldPaths=categories`, {
-                        method: 'PATCH',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            fields: {
-                                category: { stringValue: 'today offer' },
-                                categories: { arrayValue: { values: cats.map(c => ({ stringValue: c })) } }
-                            }
-                        })
+                    db.collection("products").doc(productId).update({
+                        category: "today offer",
+                        categories: cats
                     });
-                }
+                } catch (_) {}
 
                 if (prod) {
                     prod.category = 'today offer';
@@ -312,10 +309,11 @@
                 document.getElementById('actionResult').innerHTML =
                     `<div class="success">✅ Added "${productName}" to today's offers!</div>`;
 
-                // Refresh both lists
+                // Refresh both lists immediately
                 loadTodaysOffers();
                 loadAllProducts();
             } catch (error) {
+                console.error('[Offers] Error adding product:', error);
                 document.getElementById('actionResult').innerHTML =
                     `<div class="error">❌ Error adding product: ${error.message}</div>`;
             }
@@ -325,48 +323,50 @@
         async function removeFromOffers(productId, productName) {
             try {
                 const prod = allLoadedProducts.find(p => p.id === productId);
-                let cats = (prod && Array.isArray(prod.categories)) ? prod.categories.filter(c => c !== 'today offer' && c !== "today's offer") : [];
+                let cats = (prod && Array.isArray(prod.categories)) ? prod.categories.filter(c => {
+                    if (!c || typeof c !== 'string') return false;
+                    const l = c.toLowerCase().trim();
+                    return l !== 'today offer' && l !== "today's offer" && l !== 'todays offer' && l !== "today's offers" && l !== 'todays offers' && l !== 'special offer';
+                }) : [];
 
-                let updated = false;
+                const primaryCategory = cats.length > 0 ? cats[0] : '';
+
+                // Direct REST PATCH (instant 150ms)
+                const catVals = cats.map(c => ({ stringValue: c }));
+                const res = await fetch(`https://firestore.googleapis.com/v1/projects/wackykicks-65cbe/databases/(default)/documents/products/${productId}?updateMask.fieldPaths=category&updateMask.fieldPaths=categories`, {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        fields: {
+                            category: { stringValue: primaryCategory },
+                            categories: catVals.length > 0 ? { arrayValue: { values: catVals } } : { arrayValue: {} }
+                        }
+                    })
+                });
+
+                if (!res.ok) throw new Error(`REST PATCH returned HTTP ${res.status}`);
+
+                // Background SDK update
                 try {
-                    const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 2500));
-                    await Promise.race([
-                        db.collection("products").doc(productId).update({
-                            category: firebase.firestore.FieldValue.delete(),
-                            categories: cats
-                        }),
-                        timeoutPromise
-                    ]);
-                    updated = true;
-                } catch (sdkErr) {
-                    console.warn('[Admin] SDK removeFromOffers failed, using direct REST fallback:', sdkErr);
-                }
-
-                if (!updated) {
-                    await fetch(`https://firestore.googleapis.com/v1/projects/wackykicks-65cbe/databases/(default)/documents/products/${productId}?updateMask.fieldPaths=category&updateMask.fieldPaths=categories`, {
-                        method: 'PATCH',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            fields: {
-                                category: { nullValue: null },
-                                categories: { arrayValue: { values: cats.map(c => ({ stringValue: c })) } }
-                            }
-                        })
+                    db.collection("products").doc(productId).update({
+                        category: primaryCategory || firebase.firestore.FieldValue.delete(),
+                        categories: cats
                     });
-                }
+                } catch (_) {}
 
                 if (prod) {
-                    delete prod.category;
+                    prod.category = primaryCategory;
                     prod.categories = cats;
                 }
 
                 document.getElementById('actionResult').innerHTML =
                     `<div class="success">✅ Removed "${productName}" from today's offers!</div>`;
 
-                // Refresh both lists
+                // Refresh both lists immediately
                 loadTodaysOffers();
                 loadAllProducts();
             } catch (error) {
+                console.error('[Offers] Error removing product:', error);
                 document.getElementById('actionResult').innerHTML =
                     `<div class="error">❌ Error removing product: ${error.message}</div>`;
             }
@@ -462,27 +462,51 @@
             container.innerHTML = '<div class="status">Clearing all offers...</div>';
 
             try {
-                const snapshot = await db.collection("products").where("category", "==", "today offer").get();
+                if (allLoadedProducts.length === 0) {
+                    allLoadedProducts = await fetchAllProductsRest();
+                }
 
-                if (snapshot.empty) {
+                const currentOffers = allLoadedProducts.filter(checkIsOffer);
+
+                if (currentOffers.length === 0) {
                     container.innerHTML = '<div class="success">No offers to clear.</div>';
                     return;
                 }
 
-                const promises = [];
-                snapshot.forEach(doc => {
-                    promises.push(
-                        db.collection("products").doc(doc.id).update({
-                            category: firebase.firestore.FieldValue.delete()
-                        })
-                    );
-                });
+                // Process each offer product via REST PATCH
+                for (const prod of currentOffers) {
+                    const remainingCats = (prod.categories || []).filter(c => {
+                        if (!c || typeof c !== 'string') return false;
+                        const l = c.toLowerCase().trim();
+                        return l !== 'today offer' && l !== "today's offer" && l !== 'todays offer' && l !== "today's offers" && l !== 'special offer';
+                    });
+                    const primaryCat = remainingCats.length > 0 ? remainingCats[0] : '';
+                    const catVals = remainingCats.map(c => ({ stringValue: c }));
 
-                await Promise.all(promises);
+                    try {
+                        await fetch(`https://firestore.googleapis.com/v1/projects/wackykicks-65cbe/databases/(default)/documents/products/${prod.id}?updateMask.fieldPaths=category&updateMask.fieldPaths=categories`, {
+                            method: 'PATCH',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                fields: {
+                                    category: { stringValue: primaryCat },
+                                    categories: catVals.length > 0 ? { arrayValue: { values: catVals } } : { arrayValue: {} }
+                                }
+                            })
+                        });
+
+                        prod.category = primaryCat;
+                        prod.categories = remainingCats;
+                    } catch (e) {
+                        console.warn('Failed clearing offer for:', prod.id, e);
+                    }
+                }
 
                 container.innerHTML = `<div class="success">✅ Cleared all today's offers!</div>`;
                 loadTodaysOffers();
+                loadAllProducts();
             } catch (error) {
+                console.error('[Offers] Error clearing offers:', error);
                 container.innerHTML = `<div class="error">❌ Error clearing offers: ${error.message}</div>`;
             }
         }

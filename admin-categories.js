@@ -1314,32 +1314,74 @@ class AdminCategoryManager {
         }
 
         try {
-            let success = false;
+            const isTodayOffer = (categoryName && categoryName.toLowerCase().includes('today')) || categoryId === 'today offer';
 
-            // Try using categoryManager first
+            // Direct REST API delete first (instant ~150ms)
+            await restDeleteCategory(categoryId);
+
+            // If it's today's offer, also delete duplicate alias doc if exists
+            if (isTodayOffer && categoryId !== 'today offer') {
+                try { await restDeleteCategory('today offer'); } catch (_) {}
+            }
+
+            // Also delete via SDK in background if connected
+            if (typeof db !== 'undefined') {
+                try { db.collection('category').doc(categoryId).delete(); } catch (_) {}
+                if (isTodayOffer) {
+                    try { db.collection('category').doc('today offer').delete(); } catch (_) {}
+                }
+            }
+
+            // Remove from local arrays
+            this.categories = this.categories.filter(cat => {
+                if (isTodayOffer) {
+                    const name = (cat.name || '').toLowerCase();
+                    return cat.id !== categoryId && cat.id !== 'today offer' && !name.includes('today');
+                }
+                return cat.id !== categoryId;
+            });
+
             if (typeof categoryManager !== 'undefined') {
-                success = await categoryManager.deleteCategory(categoryId);
+                categoryManager.categories = categoryManager.categories.filter(cat => {
+                    if (isTodayOffer) {
+                        const name = (cat.name || '').toLowerCase();
+                        return cat.id !== categoryId && cat.id !== 'today offer' && !name.includes('today');
+                    }
+                    return cat.id !== categoryId;
+                });
             }
 
-            // Direct REST API fallback
-            if (!success) {
-                console.log('Using direct REST API delete fallback');
-                await restDeleteCategory(categoryId);
-                this.categories = this.categories.filter(cat => cat.id !== categoryId);
-                success = true;
-            }
+            // Remove from display order config document in Firestore
+            try {
+                const order = await this.fetchCurrentDisplayOrder();
+                if (order && order.length > 0) {
+                    const newOrder = order.filter(id => {
+                        const l = id.toLowerCase();
+                        if (isTodayOffer) return l !== 'today offer' && l !== 'today-offer' && !l.includes('today');
+                        return l !== categoryId.toLowerCase();
+                    });
+                    await fetch('https://firestore.googleapis.com/v1/projects/wackykicks-65cbe/databases/(default)/documents/category/CONFIG_display_order?updateMask.fieldPaths=order', {
+                        method: 'PATCH',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            fields: {
+                                order: { arrayValue: { values: newOrder.map(id => ({ stringValue: id })) } }
+                            }
+                        })
+                    });
+                }
+            } catch (_) {}
 
-            if (success) {
-                this.showMessage('Category deleted successfully!', 'success');
-                await this.loadCategories();
-                this.renderCategoriesTable();
-                this.renderCategoryCheckboxes();
-            } else {
-                this.showMessage('Failed to delete category. Please try again.', 'error');
-            }
+            // Clear cache
+            try { localStorage.removeItem('vexior_categories_cache'); } catch (_) {}
+
+            this.showMessage(`Category "${categoryName}" deleted successfully!`, 'success');
+            await this.loadCategories();
+            this.renderCategoriesTable();
+            this.renderCategoryCheckboxes();
         } catch (error) {
             console.error('Error deleting category:', error);
-            this.showMessage('Error deleting category. Please try again.', 'error');
+            this.showMessage('Error deleting category: ' + error.message, 'error');
         }
     }
 

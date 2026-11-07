@@ -486,19 +486,18 @@ class CategoryManager {
     // Delete category (for admin)
     async deleteCategory(categoryId) {
         try {
-            let deleted = false;
-            if (typeof db !== 'undefined') {
-                try {
-                    const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 2500));
-                    await Promise.race([db.collection('category').doc(categoryId).delete(), timeoutPromise]);
-                    deleted = true;
-                } catch (sdkErr) {
-                    console.warn('Category SDK delete failed, trying direct REST fallback:', sdkErr.message || sdkErr);
+            // Direct REST delete first (instant ~150ms)
+            try {
+                await this.restDeleteCategory(categoryId);
+            } catch (restErr) {
+                console.warn('[Categories] REST delete failed, trying SDK fallback:', restErr);
+                if (typeof db !== 'undefined') {
+                    await db.collection('category').doc(categoryId).delete();
                 }
             }
 
-            if (!deleted) {
-                await this.restDeleteCategory(categoryId);
+            if (typeof db !== 'undefined') {
+                try { db.collection('category').doc(categoryId).delete(); } catch (_) {}
             }
 
             this.categories = this.categories.filter(cat => cat.id !== categoryId);

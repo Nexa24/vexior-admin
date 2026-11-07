@@ -2545,7 +2545,7 @@
                         discountPercentage ? `<p style="color: #16a34a; font-weight: bold;">${discountPercentage}% OFF</p>` : '<p style="color: #666;">In Stock</p>'}
             <div class="actions">
                 <button class="edit-btn" onclick="editProduct('${product.id}')"><i class="fas fa-edit"></i> Edit</button>
-                <button class="delete-btn" onclick="deleteProduct('${product.id}')"><i class="fas fa-trash"></i> Delete</button>
+                <button class="delete-btn" onclick="deleteProduct('${product.id}', event)"><i class="fas fa-trash"></i> Delete</button>
             </div>
         `;
                 productList.appendChild(card);
@@ -2631,27 +2631,29 @@
             }
         }
 
-        // Resilient Product Delete (Firebase SDK with direct REST API fallback)
+        // Resilient Product Delete (Direct REST API with SDK fallback)
         async function deleteProductFromFirestore(productId) {
-            // Attempt 1: Try Firebase SDK with a 2.5-second timeout
+            // Attempt 1: Direct Google Cloud REST API (lightning fast ~150ms, never hangs on WebChannel)
+            try {
+                const res = await fetch(`https://firestore.googleapis.com/v1/projects/wackykicks-65cbe/databases/(default)/documents/products/${productId}`, {
+                    method: 'DELETE'
+                });
+                if (res.ok) {
+                    try { deleteDoc(doc(db, "products", productId)); } catch (_) {}
+                    return true;
+                }
+            } catch (restErr) {
+                console.warn('[Admin] Direct REST delete failed, trying SDK fallback:', restErr);
+            }
+
+            // Attempt 2: Firebase SDK fallback
             try {
                 const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Firebase SDK timeout')), 2500));
                 await Promise.race([deleteDoc(doc(db, "products", productId)), timeoutPromise]);
                 return true;
             } catch (sdkErr) {
-                console.warn('[Admin] Firebase SDK delete failed or timed out, switching to direct REST fallback:', sdkErr.message || sdkErr);
-            }
-
-            // Attempt 2: Direct Google Cloud REST API
-            try {
-                const res = await fetch(`https://firestore.googleapis.com/v1/projects/wackykicks-65cbe/databases/(default)/documents/products/${productId}`, {
-                    method: 'DELETE'
-                });
-                if (!res.ok) throw new Error(`REST DELETE returned HTTP ${res.status}`);
-                return true;
-            } catch (restErr) {
-                console.error('[Admin] REST delete failed:', restErr);
-                throw restErr;
+                console.error('[Admin] Both REST and SDK delete failed:', sdkErr);
+                throw sdkErr;
             }
         }
 
@@ -2786,28 +2788,42 @@
         };
 
         // Delete product
-        window.deleteProduct = async (id) => {
+        window.deleteProduct = async (id, event) => {
             if (!confirm("Are you sure you want to delete this product?")) return;
+
+            const btn = event ? (event.target.closest('button') || event.target) : null;
+            const card = btn ? btn.closest('.product-card') : null;
+            if (btn) {
+                btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Deleting...';
+                btn.disabled = true;
+            }
+            if (card) {
+                card.style.opacity = '0.4';
+                card.style.pointerEvents = 'none';
+            }
+
             try {
                 await deleteProductFromFirestore(id);
                 allProducts = allProducts.filter(p => p.id !== id);
                 await setCachedProductsAsync(allProducts);
-                displayProducts(allProducts);
-                updateSearchInfo(allProducts.length, allProducts.length);
-                if (window.FloatingAlertManager && typeof window.FloatingAlertManager.productDeleted === 'function') {
-                    window.FloatingAlertManager.productDeleted();
-                } else if (window.alerts && typeof window.alerts.success === 'function') {
-                    window.alerts.success('Product deleted successfully!', 'Product Deleted!');
+                if (card) {
+                    card.remove();
                 } else {
-                    alert("Product deleted successfully!");
+                    displayProducts(allProducts);
                 }
+                updateSearchInfo(allProducts.length, allProducts.length);
+                notify('success', 'Product deleted successfully!', 'Product Deleted');
             } catch (err) {
                 console.error('[Admin] Error deleting product:', err);
-                if (window.alerts && typeof window.alerts.error === 'function') {
-                    window.alerts.error("Error deleting product: " + err.message, 'Delete Error');
-                } else {
-                    alert("Error deleting product: " + err.message);
+                if (btn) {
+                    btn.innerHTML = '<i class="fas fa-trash"></i> Delete';
+                    btn.disabled = false;
                 }
+                if (card) {
+                    card.style.opacity = '1';
+                    card.style.pointerEvents = 'auto';
+                }
+                notify('error', "Error deleting product: " + err.message, 'Delete Error');
             }
         };
 
