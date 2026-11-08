@@ -1485,6 +1485,13 @@
                     <input type="number" id="productStock" min="0" placeholder="Eg: 10">
                 </div>
 
+                <div class="form-group" style="margin-top: -5px; margin-bottom: 15px;">
+                    <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; font-weight: 600; color: #dc2626;">
+                        <input type="checkbox" id="productOutOfStock" style="width: 18px; height: 18px; accent-color: #dc2626; cursor: pointer;">
+                        <span>Mark as Out of Stock (Stockout)</span>
+                    </label>
+                </div>
+
                 <div class="form-group">
                     <label>Available Sizes (comma separated)</label>
                     <input type="text" id="productSizes" placeholder="Eg: 7, 8, 9, 10">
@@ -1752,11 +1759,34 @@
         const oldPriceInput = document.getElementById("productOldPrice");
         const newPriceInput = document.getElementById("productNewPrice");
         const stockInput = document.getElementById("productStock");
+        const outOfStockCheckbox = document.getElementById("productOutOfStock");
         const imageInputsContainer = document.getElementById("imageInputs");
         const productList = document.getElementById("productList");
         const sizesInput = document.getElementById("productSizes");
         const colorsInput = document.getElementById("productColors");
         const descriptionInput = document.getElementById("productDescription");
+
+        // Sync Out of Stock checkbox with stock input
+        if (outOfStockCheckbox) {
+            outOfStockCheckbox.addEventListener('change', () => {
+                if (outOfStockCheckbox.checked) {
+                    stockInput.value = "0";
+                    stockInput.disabled = true;
+                } else {
+                    stockInput.disabled = false;
+                    if (stockInput.value === "0" || !stockInput.value) {
+                        stockInput.value = "10";
+                    }
+                }
+            });
+        }
+        if (stockInput) {
+            stockInput.addEventListener('input', () => {
+                if (outOfStockCheckbox) {
+                    outOfStockCheckbox.checked = (parseInt(stockInput.value) === 0);
+                }
+            });
+        }
 
         let editMode = false;
         let editingProductId = null;
@@ -1968,6 +1998,8 @@
             oldPriceInput.value = "";
             newPriceInput.value = "";
             stockInput.value = "";
+            stockInput.disabled = false;
+            if (outOfStockCheckbox) outOfStockCheckbox.checked = false;
             sizesInput.value = "";
             descriptionInput.value = "";
             document.getElementById("multiImageInput").value = "";
@@ -2527,7 +2559,7 @@
 
                 // Check if product is out of stock (by category or stock field)
                 const isOutOfStockByCategory = product.categories && product.categories.includes('out-of-stock');
-                const isOutOfStockByStock = product.stock !== undefined && product.stock !== null && product.stock === 0;
+                const isOutOfStockByStock = product.stock !== undefined && product.stock !== null && Number(product.stock) <= 0;
                 const isOutOfStock = isOutOfStockByCategory || isOutOfStockByStock;
 
                 // Calculate discount percentage for admin display
@@ -2537,15 +2569,19 @@
 
                 const card = document.createElement("div");
                 card.className = "product-card";
+                card.dataset.id = product.id;
                 card.innerHTML = `
             <img src="${firstImage}" alt="Product Image" onerror="this.src='../Logo/VEXIOR_logo.png'">
             <h3>${product.name}</h3>
             <p>₹${product.price || product.newPrice}</p>
-            ${isOutOfStock ? `<p style="color: #ef4444; font-weight: bold;">OUT OF STOCK</p>` :
-                        discountPercentage ? `<p style="color: #16a34a; font-weight: bold;">${discountPercentage}% OFF</p>` : '<p style="color: #666;">In Stock</p>'}
-            <div class="actions">
-                <button class="edit-btn" onclick="editProduct('${product.id}')"><i class="fas fa-edit"></i> Edit</button>
-                <button class="delete-btn" onclick="deleteProduct('${product.id}', event)"><i class="fas fa-trash"></i> Delete</button>
+            ${isOutOfStock ? `<p class="stock-status-badge" style="color: #ef4444; font-weight: bold;"><i class="fas fa-ban"></i> OUT OF STOCK</p>` :
+                        discountPercentage ? `<p class="stock-status-badge" style="color: #16a34a; font-weight: bold;">${discountPercentage}% OFF (In Stock)</p>` : '<p class="stock-status-badge" style="color: #666;">In Stock</p>'}
+            <div class="actions" style="display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px;">
+                <button class="edit-btn" onclick="editProduct('${product.id}')" style="flex: 1; min-width: 70px;"><i class="fas fa-edit"></i> Edit</button>
+                <button class="stock-btn" onclick="toggleProductStock('${product.id}', event)" title="${isOutOfStock ? 'Click to mark In Stock' : 'Click to mark Out of Stock'}" style="flex: 1.2; min-width: 95px; padding: 6px 8px; border: none; border-radius: 6px; cursor: pointer; font-size: 0.82rem; font-weight: 600; color: white; background: ${isOutOfStock ? '#16a34a' : '#ef4444'};">
+                    <i class="fas ${isOutOfStock ? 'fa-check-circle' : 'fa-ban'}"></i> ${isOutOfStock ? 'In Stock' : 'Stock Out'}
+                </button>
+                <button class="delete-btn" onclick="deleteProduct('${product.id}', event)" style="flex: 1; min-width: 70px;"><i class="fas fa-trash"></i> Delete</button>
             </div>
         `;
                 productList.appendChild(card);
@@ -2557,11 +2593,13 @@
             if (val === null || val === undefined) return { nullValue: null };
             if (typeof val === 'string') return { stringValue: val };
             if (typeof val === 'number') {
+                if (isNaN(val)) return { nullValue: null };
                 if (Number.isInteger(val)) return { integerValue: val.toString() };
                 return { doubleValue: val };
             }
             if (typeof val === 'boolean') return { booleanValue: val };
             if (Array.isArray(val)) {
+                if (val.length === 0) return { arrayValue: {} };
                 return { arrayValue: { values: val.map(toFirestoreRestValue) } };
             }
             if (typeof val === 'object') {
@@ -2585,34 +2623,22 @@
             return { fields };
         }
 
-        // Resilient Product Save (Firebase SDK with direct REST API fallback)
+        // Resilient Product Save (Direct REST API first for ~150ms instant response)
         async function saveProductToFirestore(productId, productData, isEdit) {
-            // Attempt 1: Try Firebase SDK with a 2.5-second timeout
-            try {
-                const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Firebase SDK timeout')), 2500));
-                if (isEdit) {
-                    await Promise.race([updateDoc(doc(db, "products", productId), productData), timeoutPromise]);
-                    return { success: true, id: productId };
-                } else {
-                    const docRef = await Promise.race([addDoc(collection(db, "products"), productData), timeoutPromise]);
-                    return { success: true, id: docRef.id };
-                }
-            } catch (sdkErr) {
-                console.warn('[Admin] Firebase SDK save failed or timed out, switching to direct REST API fallback:', sdkErr.message || sdkErr);
-            }
-
-            // Attempt 2: Direct Google Cloud REST API (100% reliable)
+            // Attempt 1: Direct Google Cloud REST API (lightning fast ~150ms, never hangs on WebChannel)
             try {
                 const restDoc = toFirestoreRestDoc(productData);
                 if (isEdit) {
                     const fieldMask = Object.keys(productData).filter(k => k !== 'id' && productData[k] !== undefined)
                         .map(k => `updateMask.fieldPaths=${encodeURIComponent(k)}`).join('&');
-                    const res = await fetch(`https://firestore.googleapis.com/v1/projects/wackykicks-65cbe/databases/(default)/documents/products/${productId}?${fieldMask}`, {
+                    const res = await fetch(`https://firestore.googleapis.com/v1/projects/wackykicks-65cbe/databases/(default)/documents/products/${encodeURIComponent(productId)}?${fieldMask}`, {
                         method: 'PATCH',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify(restDoc)
                     });
                     if (!res.ok) throw new Error(`REST PATCH returned HTTP ${res.status}`);
+                    // Background SDK sync
+                    try { updateDoc(doc(db, "products", productId), productData).catch(() => {}); } catch (_) {}
                     return { success: true, id: productId };
                 } else {
                     const res = await fetch(`https://firestore.googleapis.com/v1/projects/wackykicks-65cbe/databases/(default)/documents/products`, {
@@ -2626,20 +2652,34 @@
                     return { success: true, id: newId };
                 }
             } catch (restErr) {
-                console.error('[Admin] REST save also failed:', restErr);
-                throw restErr;
+                console.warn('[Admin] Direct REST save failed, attempting SDK fallback:', restErr);
+            }
+
+            // Attempt 2: Firebase SDK fallback
+            try {
+                const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Firebase SDK timeout')), 3500));
+                if (isEdit) {
+                    await Promise.race([updateDoc(doc(db, "products", productId), productData), timeoutPromise]);
+                    return { success: true, id: productId };
+                } else {
+                    const docRef = await Promise.race([addDoc(collection(db, "products"), productData), timeoutPromise]);
+                    return { success: true, id: docRef.id };
+                }
+            } catch (sdkErr) {
+                console.error('[Admin] Both REST and SDK save failed:', sdkErr);
+                throw sdkErr;
             }
         }
 
-        // Resilient Product Delete (Direct REST API with SDK fallback)
+        // Resilient Product Delete (Direct REST API with SDK background sync)
         async function deleteProductFromFirestore(productId) {
             // Attempt 1: Direct Google Cloud REST API (lightning fast ~150ms, never hangs on WebChannel)
             try {
-                const res = await fetch(`https://firestore.googleapis.com/v1/projects/wackykicks-65cbe/databases/(default)/documents/products/${productId}`, {
+                const res = await fetch(`https://firestore.googleapis.com/v1/projects/wackykicks-65cbe/databases/(default)/documents/products/${encodeURIComponent(productId)}`, {
                     method: 'DELETE'
                 });
                 if (res.ok) {
-                    try { deleteDoc(doc(db, "products", productId)); } catch (_) {}
+                    try { deleteDoc(doc(db, "products", productId)).catch(() => {}); } catch (_) {}
                     return true;
                 }
             } catch (restErr) {
@@ -2648,7 +2688,7 @@
 
             // Attempt 2: Firebase SDK fallback
             try {
-                const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Firebase SDK timeout')), 2500));
+                const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Firebase SDK timeout')), 3500));
                 await Promise.race([deleteDoc(doc(db, "products", productId)), timeoutPromise]);
                 return true;
             } catch (sdkErr) {
@@ -2657,6 +2697,78 @@
             }
         }
 
+        // Quick toggle for Product Stock (In Stock / Out of Stock) directly on card
+        window.toggleProductStock = async (id, event) => {
+            const btn = event ? (event.target.closest('button') || event.target) : null;
+            const card = btn ? btn.closest('.product-card') : null;
+            const product = allProducts.find(p => p.id === id);
+            if (!product) return;
+
+            const isCurrentlyOutOfStock = (product.categories && product.categories.includes('out-of-stock')) || (product.stock !== undefined && Number(product.stock) <= 0);
+            const makeOutOfStock = !isCurrentlyOutOfStock;
+
+            let currentCategories = Array.isArray(product.categories) ? [...product.categories] : (product.category ? [product.category] : []);
+            let newCategories;
+            let newStock;
+
+            if (makeOutOfStock) {
+                newStock = 0;
+                newCategories = currentCategories.includes('out-of-stock') ? currentCategories : [...currentCategories, 'out-of-stock'];
+            } else {
+                newStock = (product.stock && Number(product.stock) > 0) ? Number(product.stock) : 10;
+                newCategories = currentCategories.filter(c => c !== 'out-of-stock');
+            }
+
+            const originalBtnHTML = btn ? btn.innerHTML : '';
+            if (btn) {
+                btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Updating...';
+                btn.disabled = true;
+            }
+
+            try {
+                const patchData = {
+                    stock: newStock,
+                    categories: newCategories
+                };
+                await saveProductToFirestore(id, patchData, true);
+
+                // Update in memory and local storage caches
+                product.stock = newStock;
+                product.categories = newCategories;
+                await setCachedProductsAsync(allProducts);
+
+                // Update UI on card
+                if (card) {
+                    const badge = card.querySelector('.stock-status-badge') || card.querySelector('p:nth-of-type(2)');
+                    if (badge) {
+                        const discountPercentage = product.oldPrice && product.newPrice && Number(product.oldPrice) > Number(product.newPrice)
+                            ? Math.round(((Number(product.oldPrice) - Number(product.newPrice)) / Number(product.oldPrice)) * 100)
+                            : null;
+                        badge.outerHTML = makeOutOfStock
+                            ? `<p class="stock-status-badge" style="color: #ef4444; font-weight: bold;"><i class="fas fa-ban"></i> OUT OF STOCK</p>`
+                            : (discountPercentage ? `<p class="stock-status-badge" style="color: #16a34a; font-weight: bold;">${discountPercentage}% OFF (In Stock)</p>` : `<p class="stock-status-badge" style="color: #666;">In Stock</p>`);
+                    }
+                    if (btn) {
+                        btn.style.background = makeOutOfStock ? '#16a34a' : '#ef4444';
+                        btn.title = makeOutOfStock ? 'Click to mark In Stock' : 'Click to mark Out of Stock';
+                        btn.innerHTML = `<i class="fas ${makeOutOfStock ? 'fa-check-circle' : 'fa-ban'}"></i> ${makeOutOfStock ? 'In Stock' : 'Stock Out'}`;
+                        btn.disabled = false;
+                    }
+                } else {
+                    displayProducts(allProducts);
+                }
+
+                notify('success', `Product "${product.name}" marked ${makeOutOfStock ? 'Out of Stock' : 'In Stock'}!`, 'Stock Updated');
+            } catch (err) {
+                console.error('[Admin] Error toggling stock:', err);
+                if (btn) {
+                    btn.disabled = false;
+                    btn.innerHTML = originalBtnHTML;
+                }
+                notify('error', 'Error updating stock: ' + err.message, 'Stock Error');
+            }
+        };
+
         // Submit product (add or update)
         window.submitProduct = async () => {
             const name = nameInput.value.trim();
@@ -2664,7 +2776,16 @@
             const newPrice = newPriceInput.value.trim();
             const price = newPrice;
             const stockValue = stockInput.value.trim();
-            const stock = stockValue !== '' ? parseInt(stockValue) : undefined;
+            const isOutOfStockChecked = outOfStockCheckbox?.checked || false;
+
+            let stock;
+            if (isOutOfStockChecked || stockValue === '0') {
+                stock = 0;
+            } else if (stockValue !== '' && !isNaN(parseInt(stockValue))) {
+                stock = parseInt(stockValue);
+            } else {
+                stock = 10;
+            }
 
             // Get images: check uploadedImages first, then multiImageInput
             let imgUrl = [];
@@ -2695,7 +2816,16 @@
             const sizes = sizesInput.value.split(",").map(s => s.trim()).filter(s => s);
             const colors = selectedColors;
             const description = descriptionInput.value.trim();
-            const categories = getSelectedProductCategories();
+            let categories = getSelectedProductCategories();
+
+            // Synchronize out-of-stock category with stock status
+            if (stock === 0) {
+                if (!categories.includes('out-of-stock')) {
+                    categories.push('out-of-stock');
+                }
+            } else {
+                categories = categories.filter(c => c !== 'out-of-stock');
+            }
 
             if (!name || !oldPrice || !newPrice || imgUrl.length === 0) {
                 if (window.alerts && typeof window.alerts.warning === 'function') {
@@ -2727,12 +2857,9 @@
                     colors,
                     description,
                     categories,
-                    category: primaryCategory
+                    category: primaryCategory,
+                    stock
                 };
-
-                if (stock !== undefined) {
-                    productData.stock = stock;
-                }
 
                 if (editMode && editingProductId) {
                     await saveProductToFirestore(editingProductId, productData, true);
@@ -2743,13 +2870,7 @@
                     }
                     await setCachedProductsAsync(allProducts);
                     displayProducts(allProducts);
-                    if (window.FloatingAlertManager && typeof window.FloatingAlertManager.productUpdated === 'function') {
-                        window.FloatingAlertManager.productUpdated();
-                    } else if (window.alerts && typeof window.alerts.success === 'function') {
-                        window.alerts.success('Product updated successfully!', 'Product Updated!');
-                    } else {
-                        alert("Product updated successfully!");
-                    }
+                    notify('success', 'Product updated successfully!', 'Product Updated');
                 } else {
                     productData.createdAt = new Date().toISOString();
                     const result = await saveProductToFirestore(null, productData, false);
@@ -2762,23 +2883,13 @@
                     await setCachedProductsAsync(allProducts);
                     displayProducts(allProducts);
                     updateSearchInfo(allProducts.length, allProducts.length);
-                    if (window.FloatingAlertManager && typeof window.FloatingAlertManager.productAdded === 'function') {
-                        window.FloatingAlertManager.productAdded();
-                    } else if (window.alerts && typeof window.alerts.success === 'function') {
-                        window.alerts.success('Product added successfully!', 'Product Added!');
-                    } else {
-                        alert("Product added successfully!");
-                    }
+                    notify('success', 'Product added successfully!', 'Product Added');
                 }
 
                 resetForm();
             } catch (err) {
                 console.error('[Admin] Error saving product:', err);
-                if (window.alerts && typeof window.alerts.error === 'function') {
-                    window.alerts.error("Error saving product: " + err.message, 'Save Error');
-                } else {
-                    alert("Error saving product: " + err.message);
-                }
+                notify('error', "Error saving product: " + err.message, 'Save Error');
             } finally {
                 if (submitBtn) {
                     submitBtn.innerText = editMode ? "Update Product" : "Add Product";
@@ -2845,7 +2956,7 @@
 
             if (!product) {
                 try {
-                    const res = await fetch(`https://firestore.googleapis.com/v1/projects/wackykicks-65cbe/databases/(default)/documents/products/${id}`);
+                    const res = await fetch(`https://firestore.googleapis.com/v1/projects/wackykicks-65cbe/databases/(default)/documents/products/${encodeURIComponent(id)}`);
                     if (res.ok) {
                         const data = await res.json();
                         product = parseFirestoreProductDoc(data);
@@ -2863,7 +2974,17 @@
             nameInput.value = product.name || "";
             oldPriceInput.value = product.oldPrice || "";
             newPriceInput.value = product.newPrice || product.price || "";
-            stockInput.value = product.stock !== undefined ? product.stock : 0;
+
+            // Out of stock and stock status handling
+            const isOutOfStock = (product.categories && product.categories.includes('out-of-stock')) || (product.stock !== undefined && Number(product.stock) <= 0);
+            if (outOfStockCheckbox) {
+                outOfStockCheckbox.checked = isOutOfStock;
+            }
+            if (stockInput) {
+                stockInput.disabled = isOutOfStock;
+                stockInput.value = isOutOfStock ? 0 : (product.stock !== undefined ? product.stock : 10);
+            }
+
             sizesInput.value = (product.sizes || []).join(", ");
             descriptionInput.value = product.description || "";
 

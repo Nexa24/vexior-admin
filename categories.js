@@ -12,6 +12,27 @@ class CategoryManager {
         this.init();
     }
 
+    // Helper to get matching order index from categoryDisplayOrder
+    getCategoryOrderIndex(cat) {
+        if (!this.categoryDisplayOrder || this.categoryDisplayOrder.length === 0 || !cat) return 9999;
+        const candidates = [
+            cat.id,
+            cat.categoryId,
+            cat.id ? cat.id.toLowerCase() : '',
+            cat.categoryId ? cat.categoryId.toLowerCase() : '',
+            cat.name ? cat.name.toLowerCase() : '',
+            cat.name ? cat.name.toLowerCase().replace(/[^a-z0-9]/g, '-') : '',
+            cat.name ? cat.name.toLowerCase().replace(/['"’]/g, '').replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-') : '',
+            cat.name ? cat.name.toLowerCase().replace(/['"’]/g, '').trim() : ''
+        ].filter(Boolean);
+
+        for (const candidate of candidates) {
+            const idx = this.categoryDisplayOrder.findIndex(o => o && o.toLowerCase().trim() === candidate);
+            if (idx !== -1) return idx;
+        }
+        return 9999;
+    }
+
     // Sort categories based on the defined display order
     sortCategories() {
         if (!this.categoryDisplayOrder || this.categoryDisplayOrder.length === 0) {
@@ -20,17 +41,14 @@ class CategoryManager {
         }
 
         this.categories.sort((a, b) => {
-            const idA = a.id.toLowerCase();
-            const idB = b.id.toLowerCase();
+            const indexA = this.getCategoryOrderIndex(a);
+            const indexB = this.getCategoryOrderIndex(b);
 
-            let indexA = this.categoryDisplayOrder.indexOf(idA);
-            let indexB = this.categoryDisplayOrder.indexOf(idB);
+            if (indexA !== indexB) {
+                return indexA - indexB;
+            }
 
-            // If category is not in the order list, put it at the end
-            if (indexA === -1) indexA = 9999;
-            if (indexB === -1) indexB = 9999;
-
-            return indexA - indexB;
+            return (a.name || '').localeCompare(b.name || '');
         });
 
         console.log('✅ Categories sorted by custom order');

@@ -120,7 +120,7 @@ async function restSaveCategory(categoryData, categoryId = null) {
     if (categoryId) {
         const queryMask = Object.keys(categoryData).filter(k => k !== 'id' && k !== 'firebaseId' && categoryData[k] !== undefined)
             .map(k => `updateMask.fieldPaths=${encodeURIComponent(k)}`).join('&');
-        const res = await fetch(`https://firestore.googleapis.com/v1/projects/wackykicks-65cbe/databases/(default)/documents/category/${categoryId}?${queryMask}`, {
+        const res = await fetch(`https://firestore.googleapis.com/v1/projects/wackykicks-65cbe/databases/(default)/documents/category/${encodeURIComponent(categoryId)}?${queryMask}`, {
             method: 'PATCH',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(toCategoryRestDoc(categoryData))
@@ -140,7 +140,7 @@ async function restSaveCategory(categoryData, categoryId = null) {
 }
 
 async function restDeleteCategory(categoryId) {
-    const res = await fetch(`https://firestore.googleapis.com/v1/projects/wackykicks-65cbe/databases/(default)/documents/category/${categoryId}`, {
+    const res = await fetch(`https://firestore.googleapis.com/v1/projects/wackykicks-65cbe/databases/(default)/documents/category/${encodeURIComponent(categoryId)}`, {
         method: 'DELETE'
     });
     if (!res.ok) throw new Error(`REST DELETE returned HTTP ${res.status}`);
@@ -222,6 +222,27 @@ class AdminCategoryManager {
         console.log('=== END ADMIN INIT ===');
     }
 
+    // Match category to custom display order array across id, categoryId, name, or slug
+    getCategoryOrderIndex(cat, order) {
+        if (!order || !order.length || !cat) return 9999;
+        const candidates = [
+            cat.id,
+            cat.categoryId,
+            cat.id ? cat.id.toLowerCase() : '',
+            cat.categoryId ? cat.categoryId.toLowerCase() : '',
+            cat.name ? cat.name.toLowerCase() : '',
+            cat.name ? cat.name.toLowerCase().replace(/[^a-z0-9]/g, '-') : '',
+            cat.name ? cat.name.toLowerCase().replace(/['"’]/g, '').replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-') : '',
+            cat.name ? cat.name.toLowerCase().replace(/['"’]/g, '').trim() : ''
+        ].filter(Boolean);
+
+        for (const candidate of candidates) {
+            const idx = order.findIndex(o => o && o.toLowerCase().trim() === candidate);
+            if (idx !== -1) return idx;
+        }
+        return 9999;
+    }
+
     renderReorderList() {
         const list = document.getElementById('reorderList');
         if (!list) return;
@@ -233,13 +254,10 @@ class AdminCategoryManager {
             // Sort locally based on order array
             if (order && order.length > 0) {
                 sortedCats.sort((a, b) => {
-                    const idA = (a.categoryId || a.id).toLowerCase();
-                    const idB = (b.categoryId || b.id).toLowerCase();
-                    let indexA = order.indexOf(idA);
-                    let indexB = order.indexOf(idB);
-                    if (indexA === -1) indexA = 9999;
-                    if (indexB === -1) indexB = 9999;
-                    return indexA - indexB;
+                    const indexA = this.getCategoryOrderIndex(a, order);
+                    const indexB = this.getCategoryOrderIndex(b, order);
+                    if (indexA !== indexB) return indexA - indexB;
+                    return (a.name || '').localeCompare(b.name || '');
                 });
             }
 
@@ -290,14 +308,26 @@ class AdminCategoryManager {
     async fetchCurrentDisplayOrder() {
         if (typeof db !== 'undefined') {
             try {
-                const settingsDoc = await db.collection('category').doc('CONFIG_display_order').get();
+                const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 2000));
+                const settingsDoc = await Promise.race([db.collection('category').doc('CONFIG_display_order').get(), timeoutPromise]);
                 if (settingsDoc.exists) {
                     return settingsDoc.data().order || [];
                 }
-            } catch (e) { console.warn('Error fetching order', e); }
+            } catch (e) { console.warn('Error fetching order via SDK, trying REST:', e); }
+        }
+        try {
+            const res = await fetch('https://firestore.googleapis.com/v1/projects/wackykicks-65cbe/databases/(default)/documents/category/CONFIG_display_order');
+            if (res.ok) {
+                const data = await res.json();
+                if (data.fields && data.fields.order && data.fields.order.arrayValue && data.fields.order.arrayValue.values) {
+                    return data.fields.order.arrayValue.values.map(v => v.stringValue || v.integerValue || '').filter(Boolean);
+                }
+            }
+        } catch (restErr) {
+            console.warn('Error fetching order via REST:', restErr);
         }
         // Fallback default order
-        return ['all', 'today offer', 'smartwatch', 'gadgets', 'shoes', 'watches', 'wallet', 'belt', 'sunglasses', 'accessories'];
+        return ['all', 'today offer', 'buy-1-get-1-free', 'combo-offer', 'shoes', 'watches', 'gadgets', 'sunglasses', 'airpods', 'power-bank'];
     }
 
     setupDragAndDrop() {
@@ -897,13 +927,10 @@ class AdminCategoryManager {
             // Sort categories based on saved order
             if (order && order.length > 0) {
                 sortedCats.sort((a, b) => {
-                    const idA = a.id.toLowerCase();
-                    const idB = b.id.toLowerCase();
-                    let indexA = order.indexOf(idA);
-                    let indexB = order.indexOf(idB);
-                    if (indexA === -1) indexA = 9999;
-                    if (indexB === -1) indexB = 9999;
-                    return indexA - indexB;
+                    const indexA = this.getCategoryOrderIndex(a, order);
+                    const indexB = this.getCategoryOrderIndex(b, order);
+                    if (indexA !== indexB) return indexA - indexB;
+                    return (a.name || '').localeCompare(b.name || '');
                 });
             }
 
@@ -962,6 +989,7 @@ class AdminCategoryManager {
 
     reorderByTableInput() {
         const tbody = document.getElementById('categoriesTableBody');
+        if (!tbody) return;
         const rows = [...tbody.querySelectorAll('tr')];
 
         rows.sort((a, b) => {
@@ -977,7 +1005,7 @@ class AdminCategoryManager {
         // Renumber to handle duplicates or gaps
         rows.forEach((row, index) => {
             const input = row.querySelector('.table-order-input');
-            input.value = index + 1;
+            if (input) input.value = index + 1;
         });
 
         this.showMessage('Table resorted. Click "Save Display Order" to apply.', 'info');
@@ -985,12 +1013,29 @@ class AdminCategoryManager {
 
     async saveCategoryOrderFromTable() {
         const inputs = [...document.querySelectorAll('.table-order-input')];
+        if (inputs.length === 0) return;
 
         // Sort inputs by their numeric value
         inputs.sort((a, b) => (parseInt(a.value) || 9999) - (parseInt(b.value) || 9999));
 
-        // Extract IDs in sorted order (normalized to lowercase)
-        const newOrder = inputs.map(input => input.dataset.id.trim().toLowerCase());
+        // Re-order table rows in DOM immediately to reflect input values
+        const tbody = document.getElementById('categoriesTableBody');
+        if (tbody) {
+            inputs.forEach((input, idx) => {
+                const row = input.closest('tr');
+                if (row) {
+                    tbody.appendChild(row);
+                    input.value = idx + 1; // Normalize 1, 2, 3...
+                }
+            });
+        }
+
+        // Build newOrder list containing category IDs and normalized slugs
+        const newOrder = inputs.map(input => {
+            const catId = (input.dataset.id || '').trim();
+            const cat = this.categories.find(c => c.id === catId);
+            return (cat && (cat.name === "Today's Offers" || (cat.name && cat.name.toLowerCase().includes('today')))) ? "today offer" : catId.toLowerCase();
+        });
 
         console.log('💾 Saving category order:', newOrder);
 
@@ -1005,25 +1050,8 @@ class AdminCategoryManager {
         try {
             let saved = false;
 
-            // Attempt 1: Firebase SDK with timeout
-            if (typeof db !== 'undefined') {
-                try {
-                    const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 2500));
-                    await Promise.race([
-                        db.collection('category').doc('CONFIG_display_order').set({
-                            order: newOrder,
-                            updatedAt: firebase.firestore.FieldValue.serverTimestamp()
-                        }, { merge: true }),
-                        timeoutPromise
-                    ]);
-                    saved = true;
-                } catch (sdkErr) {
-                    console.warn('[Admin] Category order SDK save failed or timed out, trying REST:', sdkErr);
-                }
-            }
-
-            // Attempt 2: Direct Google Cloud REST API fallback
-            if (!saved) {
+            // Attempt 1: Direct Google Cloud REST API PATCH (instant ~100ms)
+            try {
                 const res = await fetch('https://firestore.googleapis.com/v1/projects/wackykicks-65cbe/databases/(default)/documents/category/CONFIG_display_order?updateMask.fieldPaths=order', {
                     method: 'PATCH',
                     headers: { 'Content-Type': 'application/json' },
@@ -1033,18 +1061,55 @@ class AdminCategoryManager {
                         }
                     })
                 });
-                if (!res.ok) throw new Error(`REST PATCH returned HTTP ${res.status}`);
+                if (res.ok) {
+                    saved = true;
+                    // Background SDK sync
+                    if (typeof db !== 'undefined') {
+                        try {
+                            db.collection('category').doc('CONFIG_display_order').set({
+                                order: newOrder,
+                                updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+                            }, { merge: true });
+                        } catch (_) {}
+                    }
+                }
+            } catch (restErr) {
+                console.warn('[Admin] Direct REST save category order failed, trying SDK fallback:', restErr);
+            }
+
+            // Attempt 2: Firebase SDK fallback
+            if (!saved && typeof db !== 'undefined') {
+                const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 3000));
+                await Promise.race([
+                    db.collection('category').doc('CONFIG_display_order').set({
+                        order: newOrder,
+                        updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+                    }, { merge: true }),
+                    timeoutPromise
+                ]);
                 saved = true;
             }
 
             if (saved) {
+                this.categoryDisplayOrder = newOrder;
+
+                // Invalidate and update localStorage caches so storefront picks it up immediately
+                try {
+                    localStorage.removeItem('vexior_categories_cache');
+                    localStorage.setItem('vexior_categories_cache', JSON.stringify({
+                        categories: this.categories.filter(c => c.id !== 'CONFIG_display_order'),
+                        order: newOrder,
+                        timestamp: Date.now()
+                    }));
+                } catch (_) {}
+
                 if (saveBtn) {
                     saveBtn.innerHTML = '<i class="fas fa-check"></i> Saved!';
                     saveBtn.classList.remove('btn-primary');
                     saveBtn.classList.add('btn-success');
                 }
 
-                this.showMessage('Order saved successfully!', 'success');
+                this.showMessage('Category display order saved successfully!', 'success');
 
                 setTimeout(() => {
                     if (saveBtn) {
