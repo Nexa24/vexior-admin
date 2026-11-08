@@ -140,13 +140,17 @@ class CategoryManager {
                         }
                     } catch (e) {}
 
-                    loadedCategories = categoriesSnapshot.docs.map(doc => ({
-                        id: doc.id,
-                        ...doc.data(),
-                        name: doc.data().name || 'Unnamed Category',
-                        image: doc.data().image || doc.data().icon || '',
-                        color: doc.data().color || '#667eea'
-                    }));
+                    loadedCategories = categoriesSnapshot.docs.map(doc => {
+                        const rawData = doc.data() || {};
+                        delete rawData.id;
+                        return {
+                            ...rawData,
+                            id: doc.id,
+                            name: rawData.name || 'Unnamed Category',
+                            image: rawData.image || rawData.icon || '',
+                            color: rawData.color || '#667eea'
+                        };
+                    });
                     fetchedSuccessfully = loadedCategories.length > 0;
                 } catch (sdkErr) {
                     console.warn('⚠️ Category SDK fetch failed, switching to direct REST API fallback:', sdkErr.message || sdkErr);
@@ -401,7 +405,7 @@ class CategoryManager {
         if (categoryId) {
             const queryMask = Object.keys(categoryData).filter(k => k !== 'id' && k !== 'firebaseId' && categoryData[k] !== undefined)
                 .map(k => `updateMask.fieldPaths=${encodeURIComponent(k)}`).join('&');
-            const res = await fetch(`https://firestore.googleapis.com/v1/projects/wackykicks-65cbe/databases/(default)/documents/category/${categoryId}?${queryMask}`, {
+            const res = await fetch(`https://firestore.googleapis.com/v1/projects/wackykicks-65cbe/databases/(default)/documents/category/${encodeURIComponent(categoryId)}?${queryMask}`, {
                 method: 'PATCH',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(this.toCategoryRestDoc(categoryData))
@@ -421,7 +425,7 @@ class CategoryManager {
     }
 
     async restDeleteCategory(categoryId) {
-        const res = await fetch(`https://firestore.googleapis.com/v1/projects/wackykicks-65cbe/databases/(default)/documents/category/${categoryId}`, {
+        const res = await fetch(`https://firestore.googleapis.com/v1/projects/wackykicks-65cbe/databases/(default)/documents/category/${encodeURIComponent(categoryId)}`, {
             method: 'DELETE'
         });
         if (!res.ok) throw new Error(`REST DELETE returned HTTP ${res.status}`);
@@ -431,19 +435,20 @@ class CategoryManager {
     // Add new category (for admin)
     async addCategory(categoryData) {
         try {
-            let docId = null;
+            // Remove any arbitrary id before saving
+            delete categoryData.id;
+            delete categoryData.firebaseId;
+
+            // Direct REST POST first (instant ~150ms)
+            const docId = await this.restSaveCategory(categoryData, null);
+
             if (typeof db !== 'undefined') {
                 try {
-                    const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 2500));
-                    const docRef = await Promise.race([db.collection('category').add(categoryData), timeoutPromise]);
-                    docId = docRef.id;
-                } catch (sdkErr) {
-                    console.warn('Category SDK add failed, trying direct REST fallback:', sdkErr.message || sdkErr);
-                }
-            }
-
-            if (!docId) {
-                docId = await this.restSaveCategory(categoryData, null);
+                    db.collection('category').doc(docId).set({
+                        ...categoryData,
+                        createdAt: firebase.firestore.FieldValue.serverTimestamp()
+                    }, { merge: true }).catch(() => {});
+                } catch (_) {}
             }
 
             categoryData.id = docId;
@@ -467,19 +472,16 @@ class CategoryManager {
     // Update category (for admin)
     async updateCategory(categoryId, updateData) {
         try {
-            let updated = false;
+            // Direct REST PATCH first using exact document ID
+            await this.restSaveCategory(updateData, categoryId);
+
             if (typeof db !== 'undefined') {
                 try {
-                    const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 2500));
-                    await Promise.race([db.collection('category').doc(categoryId).update(updateData), timeoutPromise]);
-                    updated = true;
-                } catch (sdkErr) {
-                    console.warn('Category SDK update failed, trying direct REST fallback:', sdkErr.message || sdkErr);
-                }
-            }
-
-            if (!updated) {
-                await this.restSaveCategory(updateData, categoryId);
+                    db.collection('category').doc(categoryId).update({
+                        ...updateData,
+                        updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+                    }).catch(() => {});
+                } catch (_) {}
             }
 
             const categoryIndex = this.categories.findIndex(cat => cat.id === categoryId);
@@ -505,17 +507,10 @@ class CategoryManager {
     async deleteCategory(categoryId) {
         try {
             // Direct REST delete first (instant ~150ms)
-            try {
-                await this.restDeleteCategory(categoryId);
-            } catch (restErr) {
-                console.warn('[Categories] REST delete failed, trying SDK fallback:', restErr);
-                if (typeof db !== 'undefined') {
-                    await db.collection('category').doc(categoryId).delete();
-                }
-            }
+            await this.restDeleteCategory(categoryId);
 
             if (typeof db !== 'undefined') {
-                try { db.collection('category').doc(categoryId).delete(); } catch (_) {}
+                try { db.collection('category').doc(categoryId).delete().catch(() => {}); } catch (_) {}
             }
 
             this.categories = this.categories.filter(cat => cat.id !== categoryId);

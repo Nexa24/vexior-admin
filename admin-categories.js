@@ -512,16 +512,19 @@ class AdminCategoryManager {
                     const categoriesSnapshot = await Promise.race([db.collection('category').get(), timeoutPromise]);
 
                     loadedCategories = categoriesSnapshot.docs.map(doc => {
-                        const rawData = doc.data();
+                        const rawData = doc.data() || {};
+                        const trueDocId = doc.id;
+                        delete rawData.id; // NEVER let stored 'id' field shadow true Firestore document ID!
+                        delete rawData.firebaseId;
                         return {
-                            id: doc.id,
-                            firebaseId: doc.id,
-                            categoryId: rawData.id || rawData.name?.toLowerCase().replace(/[^a-z0-9]/g, '-') || doc.id,
+                            ...rawData,
+                            id: trueDocId,
+                            firebaseId: trueDocId,
+                            categoryId: rawData.categoryId || rawData.name?.toLowerCase().replace(/[^a-z0-9]/g, '-') || trueDocId,
                             name: rawData.name || 'Unnamed Category',
                             image: rawData.image || rawData.icon || '',
                             color: rawData.color || '#667eea',
-                            description: rawData.description || '',
-                            ...rawData
+                            description: rawData.description || ''
                         };
                     }).filter(c => c.id !== 'CONFIG_display_order');
 
@@ -770,125 +773,126 @@ class AdminCategoryManager {
 
     async handleAddCategory(e) {
         e.preventDefault();
-        console.log('=== ADD CATEGORY DEBUG ===');
-        console.log('Form submitted:', e.target);
+        console.log('=== ADD CATEGORY ===');
 
         const formData = new FormData(e.target);
-        const categoryData = {
-            name: formData.get('name').trim(),
-            image: formData.get('image').trim(),
-            color: formData.get('color'),
-            description: formData.get('description').trim() || '',
-            createdAt: new Date().toISOString(),
-            id: Date.now().toString() // Generate ID immediately
-        };
-
-        console.log('Category data to add:', categoryData);
+        const name = formData.get('name').trim();
+        const image = formData.get('image').trim();
+        const color = formData.get('color') || '#667eea';
+        const description = formData.get('description').trim() || '';
 
         // Validation
-        if (!categoryData.name || !categoryData.image) {
-            console.log('Validation failed - missing required fields');
+        if (!name || !image) {
             this.showMessage('Please fill in all required fields.', 'error');
             return;
         }
 
-        console.log('Validation passed');
-        console.log('CategoryManager available:', typeof categoryManager !== 'undefined');
-        console.log('Firebase db available:', typeof db !== 'undefined');
+        const categoryData = {
+            name,
+            image,
+            color,
+            description,
+            createdAt: new Date().toISOString()
+        };
+
+        const submitBtn = e.target.querySelector('button[type="submit"]');
+        if (submitBtn) {
+            submitBtn.disabled = true;
+            submitBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Adding...';
+        }
 
         try {
-            let success = false;
+            // Direct REST POST first (instant ~150ms, assigns real Firestore doc ID)
+            const docId = await restSaveCategory(categoryData, null);
+            categoryData.id = docId;
+            categoryData.firebaseId = docId;
 
-            // Method 1: Try using categoryManager first
-            if (typeof categoryManager !== 'undefined') {
-                console.log('Using categoryManager.addCategory');
-                success = await categoryManager.addCategory(categoryData);
-                console.log('CategoryManager result:', success);
-            }
-            // Method 2: Direct REST API fallback
-            if (!success) {
-                console.log('Using direct REST API add fallback');
-                const docId = await restSaveCategory(categoryData, null);
-                categoryData.id = docId;
-                categoryData.firebaseId = docId;
-                this.categories.push(categoryData);
-                success = true;
+            // Background SDK sync
+            if (typeof db !== 'undefined') {
+                try {
+                    db.collection('category').doc(docId).set({
+                        ...categoryData,
+                        createdAt: firebase.firestore.FieldValue.serverTimestamp()
+                    }, { merge: true }).catch(() => {});
+                } catch (_) {}
             }
 
-            if (success) {
-                console.log('Category added successfully');
-                this.showMessage('Category added successfully!', 'success');
-                e.target.reset();
-                await this.loadCategories();
-                this.renderCategoriesTable();
-                this.renderCategoryCheckboxes();
-            } else {
-                console.log('Add failed - success was false');
-                this.showMessage('Failed to add category. Please try again.', 'error');
-            }
+            // Invalidate cache
+            try { localStorage.removeItem('vexior_categories_cache'); } catch (_) {}
+
+            this.showMessage('Category added successfully!', 'success');
+            e.target.reset();
+            await this.loadCategories();
+            this.renderCategoriesTable();
+            this.renderCategoryCheckboxes();
         } catch (error) {
             console.error('Error adding category:', error);
-            console.error('Error details:', error.stack);
             this.showMessage('Error adding category: ' + error.message, 'error');
+        } finally {
+            if (submitBtn) {
+                submitBtn.disabled = false;
+                submitBtn.innerHTML = '<i class="fas fa-save"></i> Add Category';
+            }
         }
-        console.log('=== END ADD CATEGORY DEBUG ===');
     }
 
     async handleEditCategory(e) {
         e.preventDefault();
-        console.log('=== EDIT CATEGORY DEBUG ===');
-        console.log('Form submitted:', e.target);
+        console.log('=== EDIT CATEGORY ===');
 
         const formData = new FormData(e.target);
-        const categoryId = document.getElementById('editCategoryId').value;
-        console.log('Category ID to update:', categoryId);
+        const categoryId = (document.getElementById('editCategoryId').value || '').trim();
+
+        if (!categoryId) {
+            this.showMessage('Category ID is missing. Please close and re-open the edit form.', 'error');
+            return;
+        }
 
         const updateData = {
             name: formData.get('name').trim(),
             image: formData.get('image').trim(),
-            color: formData.get('color'),
+            color: formData.get('color') || '#667eea',
             description: formData.get('description').trim() || '',
             updatedAt: new Date().toISOString()
         };
-        console.log('Update data:', updateData);
+
+        const submitBtn = e.target.querySelector('button[type="submit"]');
+        if (submitBtn) {
+            submitBtn.disabled = true;
+            submitBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Updating...';
+        }
 
         try {
-            let success = false;
+            // Direct Google Cloud REST API PATCH to the exact existing categoryId document
+            await restSaveCategory(updateData, categoryId);
 
-            // Try using categoryManager first
-            if (typeof categoryManager !== 'undefined') {
-                console.log('Using categoryManager.updateCategory');
-                success = await categoryManager.updateCategory(categoryId, updateData);
-                console.log('CategoryManager result:', success);
+            // Background SDK sync
+            if (typeof db !== 'undefined') {
+                try {
+                    db.collection('category').doc(categoryId).update({
+                        ...updateData,
+                        updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+                    }).catch(() => {});
+                } catch (_) {}
             }
 
-            // Direct REST API fallback
-            if (!success) {
-                console.log('Using direct REST API update fallback');
-                await restSaveCategory(updateData, categoryId);
-                const categoryIndex = this.categories.findIndex(cat => cat.id === categoryId);
-                if (categoryIndex > -1) {
-                    this.categories[categoryIndex] = { ...this.categories[categoryIndex], ...updateData };
-                }
-                success = true;
-            }
+            // Invalidate cache so storefront gets updated category immediately
+            try { localStorage.removeItem('vexior_categories_cache'); } catch (_) {}
 
-            if (success) {
-                this.showMessage('Category updated successfully!', 'success');
-                this.closeEditModal();
-                await this.loadCategories();
-                this.renderCategoriesTable();
-                this.renderCategoryCheckboxes();
-                console.log('Update process completed successfully');
-            } else {
-                console.log('Update failed - success was false');
-                this.showMessage('Failed to update category. Please try again.', 'error');
-            }
+            this.showMessage('Category updated successfully!', 'success');
+            this.closeEditModal();
+            await this.loadCategories();
+            this.renderCategoriesTable();
+            this.renderCategoryCheckboxes();
         } catch (error) {
-            console.error('Error in handleEditCategory:', error);
-            this.showMessage('Error updating category: ' + error.message, 'error');
+            console.error('Error updating category:', error);
+            this.showMessage('Failed to update category: ' + error.message, 'error');
+        } finally {
+            if (submitBtn) {
+                submitBtn.disabled = false;
+                submitBtn.innerHTML = '<i class="fas fa-save"></i> Update Category';
+            }
         }
-        console.log('=== END EDIT CATEGORY DEBUG ===');
     }
 
     renderCategoriesTable() {
